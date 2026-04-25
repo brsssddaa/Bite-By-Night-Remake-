@@ -1,0 +1,4044 @@
+--[[
+    Bite By Night - Project Menu
+    Modern & Compact Design
+]]
+
+local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local Stats = game:GetService("Stats")
+
+local player = Players.LocalPlayer
+local Workspace = game:GetService("Workspace")
+
+-- ========== ПЕРЕМЕННЫЕ ==========
+local allEspEnabled = false
+local autoGenEnabled = false
+local autoCursorEnabled = false
+local infinityStaminaEnabled = false
+local spiritEnabled = false
+local insBlocked = true
+local espHighlights = {}
+local espLiveToken = 0
+local espLoopThread = nil
+local spiritSphere = nil
+local spiritConn = nil
+local menuVisible = false
+local inputConnection = nil 
+local lastHealth = 100
+local lastTeleportTime = 0
+local lastKillerDist = 1000 -- Глобальная дистанция до маньяка
+
+local cachedKillerObj = nil
+local lastKillerUpdate = 0
+
+local function getKillerDist()
+    local now = tick()
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return 1000 end
+
+    -- Используем кэшированный объект если он валиден (обновляем раз в 2 секунды)
+    if cachedKillerObj and cachedKillerObj.Parent and (now - lastKillerUpdate < 2.0) then
+        local khrp = cachedKillerObj:FindFirstChild("HumanoidRootPart") or cachedKillerObj:FindFirstChildWhichIsA("BasePart", true)
+        if khrp then
+            local d = (hrp.Position - khrp.Position).Magnitude
+            lastKillerDist = d
+            return d
+        end
+    end
+
+    local killerObj = nil
+    
+    -- 1. Check Workspace.PLAYERS
+    local playersFolder = Workspace:FindFirstChild("PLAYERS")
+    local killerFolder = playersFolder and (playersFolder:FindFirstChild("KILLER") or playersFolder:FindFirstChild("Killer"))
+    if killerFolder then
+        killerObj = killerFolder:FindFirstChildWhichIsA("Model")
+    end
+    
+    -- 2. Check all players for Role attribute or Name pattern
+    if not killerObj then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p.Character and (p:GetAttribute("Role") == "Killer" or p.Name:lower():find("killer")) then
+                killerObj = p.Character
+                break
+            end
+        end
+    end
+    
+    -- 3. Check for any Humanoid in Workspace with "Killer" in name (fallback)
+    if not killerObj then
+        for _, v in ipairs(Workspace:GetChildren()) do
+            if v:IsA("Model") and v:FindFirstChild("Humanoid") and (v.Name:lower():find("killer") or v:GetAttribute("Role") == "Killer") then
+                killerObj = v
+                break
+            end
+        end
+    end
+
+    if killerObj then
+        cachedKillerObj = killerObj
+        lastKillerUpdate = now
+        local killerHRP = killerObj:FindFirstChild("HumanoidRootPart") or killerObj:FindFirstChildWhichIsA("BasePart", true)
+        if killerHRP then
+            local dist = (hrp.Position - killerHRP.Position).Magnitude
+            lastKillerDist = dist
+            return dist
+        end
+    end
+    
+    lastKillerDist = 1000
+    return 1000
+end
+local TELEPORT_COOLDOWN = 14.5
+local nextTeleportCooldown = TELEPORT_COOLDOWN
+local states = {["ESP ALL"] = false, ["AUTO CURSOR"] = false, ["AUTO GEN"] = false, ["AUTO FARM"] = false, ["INFINITY STAMINA"] = false}
+local cachedCharacterParts = {}
+local lastCharacterPartsRefresh = 0
+local CHARACTER_PARTS_REFRESH_INTERVAL = 1.2
+
+-- Сброс состояний при старте (защита от авто-запуска)
+for k, _ in pairs(states) do states[k] = false end
+states["AUTO CURSOR"] = true
+states["INFINITY STAMINA"] = true
+autoGenEnabled = false
+
+local safeZoneRepairPos = Vector3.new(464.06781005859375, 55.778804779052734, 117.6727294921875)
+local safeZoneFinalPos = Vector3.new(463.92266845703125, 55.778804779052734, 118.08235168457031)
+local isHidingUnderground = false
+local originalPosBeforeHide = nil
+local noclipConnection = nil
+local safetyWaitUntil = 0
+local filledFuseBoxes = {} -- Список использованных FuseBox
+
+local function isFuseBoxUsed(fb)
+    if not fb then return true end
+    -- Проверка по атрибуту (самая быстрая)
+    if fb:GetAttribute("Used") or fb:GetAttribute("Filled") or fb:GetAttribute("Active") then return true end
+    
+    -- Проверка по списку
+    for _, usedFb in ipairs(filledFuseBoxes) do
+        if usedFb == fb then return true end
+    end
+    
+    -- Быстрая проверка
+    local prompt = fb:FindFirstChild("ProximityPrompt") or fb:FindFirstChildWhichIsA("ProximityPrompt", true)
+    -- Если промпт есть и включен - Fusebox СВОБОДЕН
+    if prompt and prompt.Enabled then return false end
+    
+    -- Если промпта нет или он выключен - проверяем UI
+    local ui = fb:FindFirstChild("BillboardGui") or fb:FindFirstChildWhichIsA("BillboardGui", true)
+    if ui then
+        local txt = ui:FindFirstChildWhichIsA("TextLabel", true) or ui:FindFirstChild("Label", true)
+        if txt then
+            local s = txt.Text:lower()
+            -- Если видим проценты меньше 100 - значит свободен
+            if s:find("%%") then
+                local val = tonumber(s:match("(%d+)"))
+                if val and val < 99 then return false end
+            end
+            if s:find("100") or s:find("done") or s:find("full") or s:find("finish") or s:find("заряжен") then return true end
+        end
+    end
+    
+    -- Если есть промпт, но он выключен - значит использован
+    if prompt and not prompt.Enabled then return true end
+    
+    -- В сомнительных случаях (нет ни промпта, ни UI) считаем свободным, 
+    -- чтобы бот хотя бы попробовал подойти, если объект был найден как FuseBox
+    return false
+end
+
+local function markFuseBoxUsed(fb)
+    if fb and not isFuseBoxUsed(fb) then
+        table.insert(filledFuseBoxes, fb)
+        print("FuseBox marked as used.")
+    end
+end
+local hasBatteryAndHeadingToFuseBox = false -- Флаг что только что взял батарею и летим к FuseBox
+local fuseBoxTargetPosition = nil -- Позиция HumanoidRootPart FuseBox
+local justBecameAlive = false -- Флаг что только что стал Alive
+local ALIVE_COOLDOWN = 3 -- Уменьшено с 10 до 3 секунд для более быстрого старта
+local lastKnownRole = "Unknown" -- Для отслеживания смены роли
+local brokenGenerators = {} -- Список генераторов которые не удалось починить
+local currentRepairAttempts = 0 -- Количество попыток для текущего генератора
+_G.BBN_Status = "Idle" -- Глобальный статус для UI
+_G.BBN_GensRepaired = 0 -- Сколько генераторов починил я лично
+
+local forestExits = {
+    Vector3.new(-3073.821044921875, 1.75, 525.3583374023438),  -- Старая точка
+    Vector3.new(-2700.66552734375, -1.75, 545.2052001953125)   -- Новая точка
+}
+local usedForestExits = {}
+
+local pizzeriaExits = {
+    Vector3.new(-2548.82958984375, -4.750152111053467, -92.71373748779297),
+    Vector3.new(-2550.30224609375, -4.750152111053467, 55.174442291259766),
+    Vector3.new(-2502.80224609375, -4.750152587890625, 83.17437744140625)
+}
+local pizzeriaHopQueue = {}
+local pizzeriaHopIdx = 0
+local usedPizzeriaExits = {} -- Список использованных выходов на Pizzeria
+
+local function buildPizzeriaExitHopQueue()
+    pizzeriaHopQueue = {}
+    for i = 1, #pizzeriaExits do
+        pizzeriaHopQueue[i] = pizzeriaExits[i]
+    end
+    for i = #pizzeriaHopQueue, 2, -1 do
+        local j = math.random(i)
+        pizzeriaHopQueue[i], pizzeriaHopQueue[j] = pizzeriaHopQueue[j], pizzeriaHopQueue[i]
+    end
+    pizzeriaHopIdx = 1
+end
+
+local function nextPizzeriaExitPosition()
+    if pizzeriaHopIdx == 0 or pizzeriaHopIdx > #pizzeriaHopQueue then
+        buildPizzeriaExitHopQueue()
+    end
+    -- Выбираем случайный неиспользованный выход
+    local available = {}
+    for i, pos in ipairs(pizzeriaExits) do
+        if not usedPizzeriaExits[i] then
+            table.insert(available, i)
+        end
+    end
+    
+    if #available > 0 then
+        local index = available[math.random(1, #available)]
+        usedPizzeriaExits[index] = true
+        return pizzeriaExits[index]
+    else
+        -- Если все использованы, берем первый (fallback)
+        return pizzeriaExits[1]
+    end
+end
+
+local function nextForestExitPosition()
+    -- Выбираем случайный неиспользованный выход
+    local available = {}
+    for i, pos in ipairs(forestExits) do
+        if not usedForestExits[i] then
+            table.insert(available, i)
+        end
+    end
+
+    if #available > 0 then
+        local index = available[math.random(1, #available)]
+        usedForestExits[index] = true
+        return forestExits[index], index  -- Возвращаем позицию И индекс
+    else
+        -- Если все использованы, сбрасываем и берем случайный
+        usedForestExits = {}
+        local index = math.random(1, #forestExits)
+        usedForestExits[index] = true
+        return forestExits[index], index  -- Возвращаем позицию И индекс
+    end
+end
+local cabinExitFinalPos = Vector3.new(463.922, 55.778, 118.082) -- Заглушка
+local mansionExitFinalPos = Vector3.new(463.922, 55.778, 118.082) -- Заглушка
+local warehouseExitFinalPos = Vector3.new(-2597.078, -28.323, -173.520) -- Warehouse Exit (User defined)
+
+local function getExitPos()
+    local map = detectMap()
+    if map == "Forest" then return nextForestExitPosition()
+    elseif map == "Warehouse" then return warehouseExitFinalPos
+    elseif map == "Pizzeria" then return nextPizzeriaExitPosition()
+    end
+    return forestExits[1] -- Fallback
+end
+
+local function getGameTime()
+    local gameFolder = Workspace:FindFirstChild("GAME")
+    local timerValue = gameFolder and (gameFolder:FindFirstChild("TIMER") or gameFolder:FindFirstChild("Time"))
+    if timerValue then
+        return tonumber(timerValue.Value) or 0
+    end
+    return 0
+end
+
+-- ========== ЛОГИКА ==========
+local function detectMap()
+    local gameFolder = Workspace:FindFirstChild("GAME")
+    local mapValue = gameFolder and gameFolder:FindFirstChild("CURRENTMAP")
+    if mapValue and mapValue.Value ~= "" then
+        local name = tostring(mapValue.Value):upper()
+        if name:find("FOREST") then return "Forest" end
+        if name:find("WAREHOUSE") then return "Warehouse" end
+        if name:find("PIZZERIA") or name:find("PIZZA") then return "Pizzeria" end
+    end
+    local ignore = Workspace:FindFirstChild("IGNORE")
+    if ignore then
+        for _, obj in ipairs(ignore:GetChildren()) do
+            local name = obj.Name:upper()
+            if name:find("FOREST") then return "Forest" end
+            if name:find("WAREHOUSE") then return "Warehouse" end
+            if name:find("PIZZERIA") or name:find("PIZZA") then return "Pizzeria" end
+        end
+    end
+    return "Waiting..."
+end
+
+local function isGeneratorFinished(gen)
+    if not gen or not gen.Parent then return true end
+    
+    -- 1. Проверка атрибутов (наиболее надежно)
+    local progress = gen:GetAttribute("Progress") or gen:GetAttribute("progress")
+    if progress and tonumber(progress) then
+        if tonumber(progress) >= 99.9 then return true end
+        -- Если прогресс > 0, значит генератор в процессе, НЕ считаем его починенным
+        if tonumber(progress) > 0.1 then return false end
+    end
+    
+    if gen:GetAttribute("Finished") == true or gen:GetAttribute("Done") == true or gen:GetAttribute("Completed") == true then return true end
+    
+    -- 2. Проверка ProximityPrompt
+    local prompt = gen:FindFirstChildWhichIsA("ProximityPrompt", true)
+    -- Если промпт есть и включен - генератор точно НЕ починен
+    if prompt and prompt.Enabled then return false end
+    -- Если промпта нет или он выключен - это признак завершения (но не 100%, может быть забаган)
+    
+    -- 3. Проверка визуальных меток (BillboardGui)
+    local ui = gen:FindFirstChildWhichIsA("BillboardGui", true)
+    local txt = ui and ui:FindFirstChildWhichIsA("TextLabel", true)
+    if txt then
+        local s = txt.Text:lower()
+        if s:find("100") or s:find("done") or s:find("finish") or s:find("complete") or s:find("заведен") then return true end
+        if s:find("%%") then
+            local val = tonumber(s:match("(%d+)"))
+            if val and val >= 99 then return true end
+            if val and val > 0 then return false end
+        end
+    end
+    
+    -- 4. Если промпта нет, но есть BillboardGui который не показывает 100% - считаем не готовым
+    if not prompt and ui then return false end
+
+    return false
+end
+
+local function applyReliableEsp(object, color, labelText, liveToken)
+    if liveToken ~= espLiveToken then return end
+    if not object or not _G.BBN_Running or not allEspEnabled then return end
+
+    -- Очистка старых тегов с ДРУГИМ текстом (решает проблему дублирования у Minion)
+    for _, child in ipairs(object:GetChildren()) do
+        if child.Name == "BBN_Tag" and child:IsA("BillboardGui") then
+            local lbl = child:FindFirstChild("Label")
+            -- Удаляем только если текст не совпадает
+            if lbl and lbl.Text ~= labelText then
+                child:Destroy()
+            end
+        end
+    end
+
+    local highlight = object:FindFirstChild("BBN_Highlight")
+    if not highlight then
+        highlight = Instance.new("Highlight")
+        highlight.Name = "BBN_Highlight"
+        highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+        highlight.FillTransparency = 0.4
+        highlight.OutlineTransparency = 0
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.Parent = object
+        table.insert(espHighlights, highlight)
+    end
+    if liveToken ~= espLiveToken then return end
+
+    if highlight.FillColor ~= color then
+        highlight.FillColor = color
+    end
+
+    local mainPart = object:IsA("BasePart") and object or object:FindFirstChild("HumanoidRootPart") or object:FindFirstChildWhichIsA("BasePart", true)
+    if mainPart then
+        local bill = object:FindFirstChild("BBN_Tag")
+        if not bill then
+            bill = Instance.new("BillboardGui")
+            bill.Name = "BBN_Tag"
+            bill.Size = UDim2.new(0, 80, 0, 30)
+            bill.AlwaysOnTop = true
+            bill.StudsOffset = Vector3.new(0, 4, 0)
+
+            local lbl = Instance.new("TextLabel", bill)
+            lbl.Name = "Label"
+            lbl.Size = UDim2.new(1, 0, 1, 0)
+            lbl.BackgroundTransparency = 1
+            lbl.Font = Enum.Font.FredokaOne
+            lbl.TextSize = 10
+            lbl.TextStrokeTransparency = 0.5
+
+            bill.Parent = object
+            table.insert(espHighlights, bill)
+        end
+        if liveToken ~= espLiveToken then return end
+        bill.Adornee = mainPart
+        local lbl = bill:FindFirstChild("Label")
+        if lbl and (lbl.Text ~= labelText or lbl.TextColor3 ~= color) then
+            lbl.Text = labelText
+            lbl.TextColor3 = color
+        end
+    end
+end
+
+-- Кэш объектов для ESP
+local cachedObjects = {lastUpdate = 0, isScanning = false, scanStartedAt = 0, data = {generators = {}, killers = {}, survivors = {}, batteries = {}, fuseboxes = {}, escapePoints = {}, minions = {}}}
+
+local function findObjects()
+    if cachedObjects.isScanning then
+        if tick() - (cachedObjects.scanStartedAt or 0) > 15 then
+            warn("[BBN] findObjects: сброс залипшего isScanning")
+            cachedObjects.isScanning = false
+        else
+            return cachedObjects.data
+        end
+    end
+    -- На тяжёлых картах полный сбор объектов очень дорогой: повышаем интервал и сканируем только нужные ветки.
+    local foThrottle = (_G.BBN_BatteryCarrying == true) and 6.0 or 3.0
+    if tick() - cachedObjects.lastUpdate < foThrottle then
+        return cachedObjects.data
+    end
+
+    cachedObjects.scanStartedAt = tick()
+    cachedObjects.isScanning = true
+    local results = {generators = {}, killers = {}, survivors = {}, batteries = {}, fuseboxes = {}, escapePoints = {}, minions = {}}
+    local isCarryingBatteryNow = (_G.BBN_BatteryCarrying == true)
+    local success, err = pcall(function()
+        local scanned = 0
+        local function maybeYield()
+            scanned = scanned + 1
+            if scanned % 900 == 0 then
+                task.wait()
+            end
+        end
+
+        local function scanNode(obj)
+            maybeYield()
+            if not obj then return end
+            local upperName = obj.Name:upper()
+
+            if (upperName:find("GENERATOR") or upperName == "GEN" or upperName:find("STATION") or upperName:find("COMPUTER")) and (obj:IsA("Model") or obj:IsA("BasePart")) then
+                local hasBillboard = obj:FindFirstChildWhichIsA("BillboardGui", true)
+                local hasPrompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+                local hasProgress = obj:GetAttribute("Progress") ~= nil
+                if hasBillboard or hasPrompt or hasProgress then
+                    table.insert(results.generators, obj)
+                end
+            elseif upperName:find("FUSEBOX") and (obj:IsA("Model") or obj:IsA("BasePart")) then
+                table.insert(results.fuseboxes, obj)
+            elseif upperName:find("MINION") and (obj:IsA("Model") or obj:IsA("BasePart")) then
+                table.insert(results.minions, obj)
+            elseif (upperName:find("ESCAPE") or upperName:find("EXIT") or upperName:find("ESCAPEPOINT")) and (obj:IsA("Model") or obj:IsA("BasePart")) then
+                table.insert(results.escapePoints, obj)
+            end
+        end
+
+        -- 1) Игроки и роли: без глобального прохода
+        local playersFolder = Workspace:FindFirstChild("PLAYERS") or Workspace:FindFirstChild("Players")
+        local alive = playersFolder and (playersFolder:FindFirstChild("ALIVE") or playersFolder:FindFirstChild("Alive"))
+        local killer = playersFolder and (playersFolder:FindFirstChild("KILLER") or playersFolder:FindFirstChild("Killer"))
+        if killer then
+            for _, m in ipairs(killer:GetChildren()) do
+                if m:IsA("Model") and m:FindFirstChild("Humanoid") then
+                    table.insert(results.killers, m)
+                end
+            end
+        end
+        if alive then
+            for _, m in ipairs(alive:GetChildren()) do
+                if m:IsA("Model") and m.Name ~= player.Name then
+                    table.insert(results.survivors, m)
+                end
+            end
+        end
+
+        -- 2) Батареи:
+        -- Когда батарея уже в руках, не делаем дорогой глубинный обход IGNORE.
+        -- Это основной источник фризов во время батарейной фазы.
+        local ignoreFolder = Workspace:FindFirstChild("IGNORE") or Workspace:FindFirstChild("Ignore")
+        local mapsFolder = Workspace:FindFirstChild("Maps") or Workspace:FindFirstChild("MAPS")
+        local mapRoot = mapsFolder and (mapsFolder:FindFirstChild("GAME MAP") or mapsFolder:FindFirstChild("Game Map"))
+        local batteryFolder = mapRoot and (mapRoot:FindFirstChild("Batteries") or mapRoot:FindFirstChild("BATTERIES"))
+
+        local seenBattery = {}
+        local function pushBatteryRoot(obj)
+            if not obj then return end
+            local root = obj
+            local cursor = obj.Parent
+            -- Поднимаемся до папки-контейнера или Workspace
+            while cursor and cursor ~= ignoreFolder and cursor ~= batteryFolder and cursor ~= Workspace do
+                local cn = cursor.Name:upper()
+                if cn:find("BATTERY") or cn == "BAT" then
+                    root = cursor
+                end
+                cursor = cursor.Parent
+            end
+            if not seenBattery[root] then
+                seenBattery[root] = true
+                table.insert(results.batteries, root)
+            end
+        end
+
+        -- Сбор из папки Batteries на карте (если есть)
+        if batteryFolder then
+            for _, obj in ipairs(batteryFolder:GetChildren()) do
+                pushBatteryRoot(obj)
+            end
+        end
+
+        -- Сбор из IGNORE
+        if ignoreFolder then
+            if isCarryingBatteryNow then
+                -- Дешёвый режим: достаточно верхнего уровня IGNORE.
+                for _, obj in ipairs(ignoreFolder:GetChildren()) do
+                    local un = obj.Name:upper()
+                    if (un:find("BATTERY") or un == "BAT") and (obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Tool")) then
+                        pushBatteryRoot(obj)
+                    end
+                end
+            else
+                -- Полный режим: собираем ВСЕ батареи из IGNORE.
+                for _, obj in ipairs(ignoreFolder:GetDescendants()) do
+                    if not _G.BBN_Running then break end
+                    local un = obj.Name:upper()
+                    if (un:find("BATTERY") or un == "BAT") and (obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Tool")) then
+                        pushBatteryRoot(obj)
+                    end
+                end
+            end
+        end
+
+        -- Fallback: поиск "Battery" в корне карты и в папке Batteries
+        if mapRoot and not isCarryingBatteryNow then
+            -- Сначала проверяем саму папку Batteries (если она не была обработана)
+            if batteryFolder then
+                for _, obj in ipairs(batteryFolder:GetDescendants()) do
+                    local un = obj.Name:upper()
+                    if un:find("BATTERY") or un == "BAT" then
+                        pushBatteryRoot(obj)
+                    end
+                end
+            end
+            -- Затем детей корня карты
+            for _, obj in ipairs(mapRoot:GetChildren()) do
+                local un = obj.Name:upper()
+                if un:find("BATTERY") or un == "BAT" then
+                    pushBatteryRoot(obj)
+                end
+            end
+        end
+
+        -- 3) Карта: сканируем несколько известных корней карты (а не только "GAME MAP")
+        local scannedRoots = {}
+        local function scanRootDesc(root)
+            if not root or scannedRoots[root] then return end
+            scannedRoots[root] = true
+            for _, obj in ipairs(root:GetDescendants()) do
+                if not _G.BBN_Running then break end
+                scanNode(obj)
+            end
+        end
+
+        local mapsFolder = Workspace:FindFirstChild("Maps") or Workspace:FindFirstChild("MAPS")
+        local gameFolder = Workspace:FindFirstChild("GAME") or Workspace:FindFirstChild("Game")
+        local mapRoot = mapsFolder and (mapsFolder:FindFirstChild("GAME MAP") or mapsFolder:FindFirstChild("Game Map"))
+
+        -- ВСЕГДА сканируем корень карты и GAME папку, так как там FuseBoxes и таймеры
+        scanRootDesc(mapRoot)
+        scanRootDesc(gameFolder)
+
+        if not isCarryingBatteryNow then
+            if mapsFolder then
+                for _, m in ipairs(mapsFolder:GetChildren()) do
+                    if m:IsA("Folder") or m:IsA("Model") then
+                        scanRootDesc(m)
+                    end
+                end
+            end
+            scanRootDesc(ignoreFolder)
+        else
+            -- В carry-фазе пропускаем только тяжелый IGNORE и дополнительные папки карт
+            -- Киллеры уже собраны выше из PLAYERS.
+        end
+        local minionFolder = Workspace:FindFirstChild("Minion")
+        if not minionFolder and ignoreFolder then
+            minionFolder = ignoreFolder:FindFirstChild("Minion")
+        end
+        if minionFolder then
+            local seenMinion = {}
+            for _, m in ipairs(minionFolder:GetDescendants()) do
+                if m:IsA("Model") or m:IsA("BasePart") then
+                    local root = m
+                    local p = m.Parent
+                    while p and p ~= minionFolder and p ~= Workspace do
+                        root = p
+                        p = p.Parent
+                    end
+                    if not seenMinion[root] then
+                        seenMinion[root] = true
+                        table.insert(results.minions, root)
+                    end
+                end
+            end
+        end
+
+        -- Резерв: если генераторы не найдены и мы НЕ несем батарею
+        if #results.generators == 0 and not isCarryingBatteryNow then
+            for _, top in ipairs(Workspace:GetChildren()) do
+                if not _G.BBN_Running then break end
+                local n = top.Name:upper()
+                if top ~= playersFolder and (top:IsA("Folder") or top:IsA("Model")) and (n:find("MAP") or n:find("GAME") or n:find("IGNORE") or n:find("ENV")) then
+                    scanRootDesc(top)
+                end
+            end
+        end
+    end)
+
+    if success then
+        cachedObjects.data = results
+        cachedObjects.lastUpdate = tick()
+    else
+        warn("[BBN] findObjects failed: " .. tostring(err))
+    end
+    cachedObjects.isScanning = false
+    return cachedObjects.data
+end
+
+local function destroyInstanceList(list)
+    for i = #list, 1, -1 do
+        local inst = list[i]
+        if inst then
+            pcall(function() inst:Destroy() end)
+        end
+    end
+end
+
+-- Полная чистка ESP без лагов: только Workspace (не весь game), сбор в таблицу + редкие task.wait при обходе
+local function clearEsp()
+    for _, obj in pairs(espHighlights) do
+        if obj then
+            pcall(function() obj:Destroy() end)
+        end
+    end
+    espHighlights = {}
+    local wipe = {}
+    local desc = Workspace:GetDescendants()
+    for i = 1, #desc do
+        local inst = desc[i]
+        local n = inst.Name
+        if n == "BBN_Highlight" or n == "BBN_Tag" then
+            wipe[#wipe + 1] = inst
+        end
+        if i % 3000 == 0 then
+            task.wait()
+        end
+    end
+    destroyInstanceList(wipe)
+    local ch = player.Character
+    if ch and not ch:IsDescendantOf(Workspace) then
+        for _, inst in ipairs(ch:GetDescendants()) do
+            local n = inst.Name
+            if n == "BBN_Highlight" or n == "BBN_Tag" then
+                pcall(function() inst:Destroy() end)
+            end
+        end
+    end
+end
+
+local function espPurgeIfStillOff(offToken)
+    if allEspEnabled or offToken ~= espLiveToken then return end
+    clearEsp()
+end
+
+-- Минимум отложенных полных проходов (без 5–6 вызовов подряд — они давали фризы)
+local function scheduleEspOffPurges(offSessionToken)
+    task.defer(function() espPurgeIfStillOff(offSessionToken) end)
+    task.delay(0.45, function() espPurgeIfStillOff(offSessionToken) end)
+end
+
+local function cancelEspLoopThread()
+    local t = espLoopThread
+    espLoopThread = nil
+    if t then
+        pcall(task.cancel, t)
+    end
+end
+
+local function toggleAllEsp(enable)
+    if not enable then
+        allEspEnabled = false
+        states["ESP ALL"] = false
+        cancelEspLoopThread()
+        espLiveToken = espLiveToken + 1
+        local offSession = espLiveToken
+        clearEsp()
+        scheduleEspOffPurges(offSession)
+        return
+    end
+
+    espLiveToken = espLiveToken + 1
+    local sessionLive = espLiveToken
+    allEspEnabled = true
+    states["ESP ALL"] = true
+    cancelEspLoopThread()
+
+    local th
+    th = task.spawn(function()
+        local ok, err = pcall(function()
+            while allEspEnabled and _G.BBN_Running and sessionLive == espLiveToken do
+                local found = findObjects()
+                if not allEspEnabled or sessionLive ~= espLiveToken then
+                    clearEsp()
+                    break
+                end
+
+                for _, k in ipairs(found.killers) do
+                    if not allEspEnabled or sessionLive ~= espLiveToken then break end
+                    if k.Name ~= player.Name then
+                        applyReliableEsp(k, Color3.fromRGB(255, 50, 50), "KILLER", sessionLive)
+                    end
+                end
+
+                for _, s in ipairs(found.survivors) do
+                    if not allEspEnabled or sessionLive ~= espLiveToken then break end
+                    applyReliableEsp(s, Color3.fromRGB(50, 255, 50), s.Name, sessionLive)
+                end
+
+                for _, g in ipairs(found.generators) do
+                    if not allEspEnabled or sessionLive ~= espLiveToken then break end
+                    local finished = isGeneratorFinished(g)
+                    local color = finished and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(255, 0, 0)
+                    applyReliableEsp(g, color, finished and "DONE" or "IDLE", sessionLive)
+                end
+
+                for _, b in ipairs(found.batteries) do
+                    if not allEspEnabled or sessionLive ~= espLiveToken then break end
+                    applyReliableEsp(b, Color3.fromRGB(0, 150, 255), "BATTERY", sessionLive)
+                end
+
+                for _, m in ipairs(found.minions or {}) do
+                    if not allEspEnabled or sessionLive ~= espLiveToken then break end
+                    applyReliableEsp(m, Color3.fromRGB(255, 120, 0), "MINION", sessionLive)
+                end
+
+                task.wait(0.5)
+            end
+        end)
+        if not ok and err then
+            warn("[BBN] ESP loop: " .. tostring(err))
+        end
+        if espLoopThread == th then
+            espLoopThread = nil
+        end
+        if sessionLive ~= espLiveToken then
+            return
+        end
+        if not allEspEnabled or not _G.BBN_Running then
+            clearEsp()
+        end
+    end)
+    espLoopThread = th
+end
+
+local function getFurthestUnfinishedGenerator()
+    local found = findObjects()
+    local char = player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return nil end
+    local myPos = char.HumanoidRootPart.Position
+    local furthest = nil
+    local maxDist = -1
+    for _, gen in ipairs(found.generators) do
+        if not isGeneratorFinished(gen) then
+            local genPart = gen:IsA("BasePart") and gen or gen:FindFirstChildWhichIsA("BasePart", true)
+            if genPart then
+                local dist = (myPos - genPart.Position).Magnitude
+                if dist > maxDist then
+                    maxDist = dist
+                    furthest = gen
+                end
+            end
+        end
+    end
+    return furthest
+end
+
+local function hasBattery()
+    local now = tick()
+    if _G.BBN_BatteryCacheTime and (now - _G.BBN_BatteryCacheTime) < 0.25 then
+        return _G.BBN_BatteryCacheValue == true
+    end
+    
+    local char = player.Character
+    local backpack = player:FindFirstChild("Backpack")
+    
+    local batteryResult = false
+    
+    local function check(obj)
+        if not obj then return false end
+        local name = obj.Name:upper()
+        return name:find("BATTERY") or name == "BAT"
+    end
+
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if check(item) then
+                batteryResult = true
+                break
+            end
+        end
+    end
+    
+    if not batteryResult and char then
+        -- Проверяем инструменты в руках
+        for _, item in ipairs(char:GetChildren()) do
+            if item:IsA("Tool") and check(item) then
+                batteryResult = true
+                break
+            end
+            -- Проверяем если батарея просто прикреплена к персонажу (не как Tool)
+            if (item:IsA("Model") or item:IsA("BasePart")) and check(item) then
+                batteryResult = true
+                break
+            end
+        end
+    end
+    
+    _G.BBN_BatteryCacheValue = batteryResult
+    _G.BBN_BatteryCacheTime = now
+    return batteryResult
+end
+
+local function anyoneElseHasBattery()
+    local playersFolder = Workspace:FindFirstChild("PLAYERS")
+    local alive = playersFolder and playersFolder:FindFirstChild("ALIVE")
+    if alive then
+        for _, other in ipairs(alive:GetChildren()) do
+            if other:IsA("Model") and other.Name ~= player.Name then
+                if other:FindFirstChild("Battery") then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function isHeldByOther(obj)
+    if not obj or not obj.Parent then return false end
+    
+    -- Проверка на нахождение в IGNORE - если там, то НЕ занято другими игроками
+    local fullPath = obj:GetFullName()
+    if fullPath:find("IGNORE") or fullPath:find("Ignore") then
+        return false
+    end
+    
+    -- 1. Проверка: находится ли объект внутри персонажа другого игрока
+    local current = obj.Parent
+    while current and current ~= Workspace do
+        if current:IsA("Model") then
+            -- Если есть Humanoid и это не я
+            if current:FindFirstChildWhichIsA("Humanoid") then
+                return current.Name ~= player.Name
+            end
+            -- Если родитель - папка ALIVE или PLAYERS, и имя модели не моё
+            local pName = current.Parent and current.Parent.Name:upper() or ""
+            if (pName == "ALIVE" or pName == "PLAYERS" or pName == "KILLER") and current.Name ~= player.Name then
+                return true
+            end
+        elseif current:IsA("Tool") then
+            -- Если объект внутри Tool, проверяем кто держит этот Tool
+            local char = current.Parent
+            if char and char:IsA("Model") and char:FindFirstChildWhichIsA("Humanoid") then
+                return char.Name ~= player.Name
+            end
+            return true -- Если в тулзе, но персонаж не найден - скорее всего кем-то поднят
+        end
+        current = current.Parent
+    end
+    
+    -- 2. Проверка атрибутов (в некоторых играх ставится атрибут при подборе)
+    if obj:GetAttribute("Held") or obj:GetAttribute("Owner") or obj:GetAttribute("Picked") then
+        local owner = obj:GetAttribute("Owner")
+        if owner and tostring(owner) ~= player.Name then return true end
+        return not owner -- Если Held=true но Owner нет - считаем занятым
+    end
+
+    return false
+end
+
+local currentTween = nil
+local lastAimTime = 0
+local function smoothAim(targetPos, duration)
+    local cam = Workspace.CurrentCamera
+    local targetCF = CFrame.new(cam.CFrame.Position, targetPos)
+    
+    if currentTween then currentTween:Cancel() end
+    
+    -- Сохраняем старый тип камеры и ставим Scriptable
+    if cam.CameraType ~= Enum.CameraType.Scriptable then
+        cam.CameraType = Enum.CameraType.Scriptable
+    end
+    
+    local myAimTime = tick()
+    lastAimTime = myAimTime
+    
+    local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+    currentTween = TweenService:Create(cam, tweenInfo, {CFrame = targetCF})
+    currentTween:Play()
+    
+    -- После завершения твина возвращаем Custom тип, но только если не было нового вызова
+    task.spawn(function()
+        currentTween.Completed:Wait()
+        if lastAimTime == myAimTime and cam.CameraType == Enum.CameraType.Scriptable then
+            cam.CameraType = Enum.CameraType.Custom
+        end
+    end)
+    
+    return currentTween
+end
+
+local function isMinionOnMe(foundMinions, char, hrp)
+    if not char or not hrp then return false end
+    local head = char:FindFirstChild("Head")
+    local leftFoot = char:FindFirstChild("LeftFoot") or char:FindFirstChild("Left Leg") or char:FindFirstChild("LeftLowerLeg")
+    local rightFoot = char:FindFirstChild("RightFoot") or char:FindFirstChild("Right Leg") or char:FindFirstChild("RightLowerLeg")
+    for _, d in ipairs(char:GetDescendants()) do
+        local dn = d.Name and d.Name:upper() or ""
+        if dn:find("MINION") then
+            return true
+        end
+    end
+    for _, m in ipairs(foundMinions or {}) do
+        local mp = m:IsA("BasePart") and m or m:FindFirstChildWhichIsA("BasePart", true)
+        if mp then
+            if (mp.Position - hrp.Position).Magnitude <= 3.6 then return true end
+            if head and (mp.Position - head.Position).Magnitude <= 3.2 then return true end
+            if leftFoot and (mp.Position - leftFoot.Position).Magnitude <= 3.4 then return true end
+            if rightFoot and (mp.Position - rightFoot.Position).Magnitude <= 3.4 then return true end
+            local legsPoint = hrp.Position - Vector3.new(0, 2.6, 0)
+            if (mp.Position - legsPoint).Magnitude <= 3.5 then return true end
+        end
+    end
+    return false
+end
+
+local function shakeCameraRapid(seconds, stillNeededFn)
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local oldType = cam.CameraType
+    cam.CameraType = Enum.CameraType.Scriptable
+    local t0 = tick()
+    while tick() - t0 < (seconds or 0.8) and _G.BBN_Running do
+        if stillNeededFn and not stillNeededFn() then
+            break
+        end
+        local sign = ((math.floor((tick() - t0) * 24) % 2) == 0) and 1 or -1
+        local yaw = math.rad(18 * sign)
+        local side = 0.18 * sign
+        -- Быстрое раскачивание только влево/вправо
+        cam.CFrame = cam.CFrame * CFrame.Angles(0, yaw, 0) * CFrame.new(side, 0, 0)
+        task.wait(0.035)
+    end
+    if cam and cam.Parent then
+        cam.CameraType = oldType == Enum.CameraType.Scriptable and Enum.CameraType.Custom or oldType
+    end
+end
+
+local _batteryFallbackCache = {time = 0, list = {}}
+local function getBatteryFallbackList()
+    local now = tick()
+    if now - (_batteryFallbackCache.time or 0) < 5.0 then
+        return _batteryFallbackCache.list or {}
+    end
+
+    local out = {}
+    local ignoreFolder = Workspace:FindFirstChild("IGNORE") or Workspace:FindFirstChild("Ignore")
+    if ignoreFolder then
+        local seen = {}
+        -- Сначала быстрый проход только по детям IGNORE (дешево)
+        for _, obj in ipairs(ignoreFolder:GetChildren()) do
+            local un = obj.Name and obj.Name:upper() or ""
+            if (un:find("BATTERY") or un == "BAT") and (obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Tool")) then
+                seen[obj] = true
+                out[#out + 1] = obj
+            end
+        end
+
+        -- Если детей с батареями не нашли — редкий глубокий проход
+        if #out == 0 then
+            for _, obj in ipairs(ignoreFolder:GetDescendants()) do
+                local un = obj.Name and obj.Name:upper() or ""
+                if (un:find("BATTERY") or un == "BAT") and (obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Tool")) then
+                    local root = obj
+                    local p = obj.Parent
+                    while p and p ~= ignoreFolder and p ~= Workspace do
+                        local pn = p.Name and p.Name:upper() or ""
+                        if pn:find("BATTERY") or pn == "BAT" then
+                            root = p
+                        end
+                        p = p.Parent
+                    end
+                    if not seen[root] then
+                        seen[root] = true
+                        out[#out + 1] = root
+                    end
+                end
+            end
+        end
+    end
+    _batteryFallbackCache.time = now
+    _batteryFallbackCache.list = out
+    return out
+end
+
+-- ========== LOADING MENU ==========
+local function showLoadingMenu()
+    local loadingGui = Instance.new("ScreenGui")
+    loadingGui.Name = "BBN_Loading"
+    loadingGui.Parent = CoreGui
+    
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Size = UDim2.new(0, 300, 0, 120)
+    mainFrame.Position = UDim2.new(0.5, -150, 0.5, -60)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    mainFrame.BorderSizePixel = 0
+    mainFrame.Parent = loadingGui
+    
+    local uiCorner = Instance.new("UICorner")
+    uiCorner.CornerRadius = UDim.new(0, 8)
+    uiCorner.Parent = mainFrame
+    
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 30)
+    title.BackgroundTransparency = 1
+    title.Text = "Bite By Night - Loading"
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.TextSize = 16
+    title.Font = Enum.Font.GothamBold
+    title.Parent = mainFrame
+    
+    local infoText = Instance.new("TextLabel")
+    infoText.Size = UDim2.new(1, 0, 0, 20)
+    infoText.Position = UDim2.new(0, 0, 0, 30)
+    infoText.BackgroundTransparency = 1
+    infoText.Text = "Loading..."
+    infoText.TextColor3 = Color3.fromRGB(150, 150, 150)
+    infoText.TextSize = 11
+    infoText.Font = Enum.Font.Gotham
+    infoText.Parent = mainFrame
+    
+    local progressBackground = Instance.new("Frame")
+    progressBackground.Size = UDim2.new(0.8, 0, 0, 12)
+    progressBackground.Position = UDim2.new(0.1, 0, 0.6, 0)
+    progressBackground.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    progressBackground.BorderSizePixel = 0
+    progressBackground.Parent = mainFrame
+    
+    local progressCorner = Instance.new("UICorner")
+    progressCorner.CornerRadius = UDim.new(1, 0)
+    progressCorner.Parent = progressBackground
+    
+    local progressBar = Instance.new("Frame")
+    progressBar.Size = UDim2.new(0, 0, 1, 0)
+    progressBar.BackgroundColor3 = Color3.fromRGB(0, 170, 255)
+    progressBar.BorderSizePixel = 0
+    progressBar.Parent = progressBackground
+    
+    local barCorner = Instance.new("UICorner")
+    barCorner.CornerRadius = UDim.new(1, 0)
+    barCorner.Parent = progressBar
+    
+    local status = Instance.new("TextLabel")
+    status.Size = UDim2.new(1, 0, 0, 20)
+    status.Position = UDim2.new(0, 0, 0.8, 0)
+    status.BackgroundTransparency = 1
+    status.Text = "Initializing..."
+    status.TextColor3 = Color3.fromRGB(150, 150, 150)
+    status.TextSize = 12
+    status.Font = Enum.Font.Gotham
+    status.Parent = mainFrame
+    
+    local steps = {
+        {0.2, "Loading Assets..."},
+        {0.5, "Initializing UI..."},
+        {0.8, "Starting Logic..."},
+        {1.0, "Ready!"}
+    }
+    
+    for _, step in ipairs(steps) do
+        local tween = TweenService:Create(progressBar, TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {Size = UDim2.new(step[1], 0, 1, 0)})
+        tween:Play()
+        status.Text = step[2]
+        tween.Completed:Wait()
+    end
+    
+    task.wait(0.3)
+    loadingGui:Destroy()
+end
+task.spawn(showLoadingMenu)
+
+local function canTeleport(isKillerProtection, ignoreHiding)
+    -- ПРОВЕРКА: Не телепортируемся, если мы прячемся или летим (защита)
+    if not ignoreHiding and (isHidingUnderground or isFlying) then return false end
+
+    -- Единый кулдаун для всех телепортов.
+    local elapsed = tick() - lastTeleportTime
+    return elapsed >= TELEPORT_COOLDOWN
+end
+
+local function markTeleport()
+    lastTeleportTime = tick()
+    nextTeleportCooldown = TELEPORT_COOLDOWN
+    print(string.format("[Teleport] Marked at %.1f. Next CD: %.1f", lastTeleportTime, nextTeleportCooldown))
+end
+
+local function pressKey(keyCode)
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+        task.wait(0.05)
+        VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+    end)
+end
+
+-- ========== LOGIC FOR HIDING UNDERGROUND ==========
+local function refreshCharacterParts(force)
+    local now = tick()
+    if not force and (now - lastCharacterPartsRefresh) < CHARACTER_PARTS_REFRESH_INTERVAL then
+        return
+    end
+    lastCharacterPartsRefresh = now
+    cachedCharacterParts = {}
+    local char = player.Character
+    if not char then return end
+    for _, inst in ipairs(char:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            cachedCharacterParts[#cachedCharacterParts + 1] = inst
+        end
+    end
+end
+
+local function toggleNoclip(state)
+    if state then
+        if not noclipConnection then
+            refreshCharacterParts(true)
+            noclipConnection = RunService.Stepped:Connect(function()
+                refreshCharacterParts(false)
+                for i = 1, #cachedCharacterParts do
+                    local part = cachedCharacterParts[i]
+                    if part and part.Parent then
+                        part.CanCollide = false
+                    else
+                        -- Обновим кэш на следующем тике, если часть пропала.
+                        lastCharacterPartsRefresh = 0
+                        break
+                    end
+                end
+            end)
+        end
+    else
+        if noclipConnection then
+            noclipConnection:Disconnect()
+            noclipConnection = nil
+        end
+    end
+end
+
+local function makeObjectsTransparent()
+    if areObjectsTransparent then return end
+    areObjectsTransparent = true
+    transparentObjects = {}
+
+    -- Важно: не сканируем весь Workspace (это даёт фризы).
+    -- Меняем только ближайшие части вокруг игрока.
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local overlap = OverlapParams.new()
+    overlap.FilterType = Enum.RaycastFilterType.Exclude
+    overlap.FilterDescendantsInstances = {char}
+    local nearbyParts = Workspace:GetPartBoundsInRadius(hrp.Position, 300, overlap)  -- Увеличил с 220 до 300
+
+    for i = 1, #nearbyParts do
+        local obj = nearbyParts[i]
+        if obj and obj:IsA("BasePart") and obj.CanCollide then
+            transparentObjects[obj] = {coll = obj.CanCollide, trans = obj.Transparency}
+            obj.CanCollide = false
+            -- Пол/земля/стены делаем прозрачными
+            local n = obj.Name:lower()
+            if n:find("floor") or n:find("ground") or n:find("land") or n:find("wall") or n:find("ceiling") then
+                obj.Transparency = 0.7  -- Увеличил прозрачность с 0.6 до 0.7
+            end
+        end
+    end
+
+    print("Global noclip & partial transparency enabled (radius: 300)")
+end
+
+local function restoreObjectsTransparency()
+    if not areObjectsTransparent then return end
+    areObjectsTransparent = false
+
+    for part, data in pairs(transparentObjects) do
+        if part and part.Parent then
+            part.CanCollide = data.coll
+            part.Transparency = data.trans
+        end
+    end
+
+    transparentObjects = {}
+    print("Objects collision restored")
+end
+
+local flyConnection = nil
+local isFlying = false
+local flyDirection = nil -- "down" or "up"
+local hideStartTime = 0 -- Время когда начали прятаться
+local MIN_DEPTH_Y = -70 -- Минимальная глубина до -70
+local justReturnedFromUnderground = false -- Флаг что только что вернулся на поверхность
+local RETURN_COOLDOWN = 3 -- Кулдаун в секундах после возврата на поверхль
+local transparentObjects = {} -- Для хранения прозрачных объектов
+local areObjectsTransparent = false -- Флаг прозрачности
+
+local function startFlyDown(depthY)
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        isFlying = true
+        flyDirection = "down"
+        hrp.Anchored = false 
+
+        -- ЧАСТИ ТЕЛА БОЛЬШЕ НЕ СКРЫВАЕМ (Transparency = 1 удалено)
+        for _, part in pairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = false
+            end
+        end
+
+        flyConnection = RunService.Heartbeat:Connect(function()
+            if isFlying and hrp and hrp.Parent then
+                if flyDirection == "down" then
+                    if hrp.Position.Y <= depthY then
+                        hrp.Velocity = Vector3.new(0, 0, 0)
+                        hrp.Anchored = true
+                        hrp.CFrame = CFrame.new(hrp.Position.X, depthY, hrp.Position.Z)
+                        isFlying = false
+                        flyDirection = nil
+                        if flyConnection then flyConnection:Disconnect() end
+                        flyConnection = nil
+                        
+                        task.spawn(function()
+                            while isHidingUnderground and _G.BBN_Running do
+                                if hrp and hrp.Parent then
+                                    hrp.Anchored = true
+                                    hrp.Velocity = Vector3.new(0, -5, 0)
+                                    if math.abs(hrp.Position.Y - depthY) > 1 then
+                                        hrp.CFrame = CFrame.new(hrp.Position.X, depthY, hrp.Position.Z)
+                                    end
+                                end
+                                task.wait(0.1)
+                            end
+                        end)
+                    else
+                        hrp.Velocity = Vector3.new(0, -120, 0)
+                        hrp.CFrame = hrp.CFrame * CFrame.new(0, -2.5, 0)
+                    end
+                end
+            end
+        end)
+    end
+end
+
+local function startFlyUp(targetY)
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        isFlying = true
+        flyDirection = "up"
+        hrp.Anchored = false -- Размораживаем для полета
+
+        -- Отключаем коллизию чтобы пролетать сквозь объекты
+        for _, part in pairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = false
+            end
+        end
+
+        -- Создаем флай вверх
+        flyConnection = RunService.Heartbeat:Connect(function()
+            if isFlying and hrp and hrp.Parent then
+                if flyDirection == "up" then
+                    -- Проверяем достиг ли нужной высоты
+                    if hrp.Position.Y >= targetY then
+                        -- Достигли высоты - останавливаемся и ЗАМОРАЖИВАЕМ
+                        hrp.Velocity = Vector3.new(0, 0, 0)
+                        hrp.Anchored = true
+                        
+                        -- Постоянно фиксируем в одной точке чтобы не телепортировало обратно
+                        hrp.CFrame = CFrame.new(hrp.Position.X, targetY, hrp.Position.Z)
+                        
+                        isFlying = false
+                        flyDirection = nil
+                        if flyConnection then flyConnection:Disconnect() end
+                        flyConnection = nil
+                        print("Reached height. Frozen in air at Y: " .. hrp.Position.Y)
+                        
+                        -- Дополнительный цикл фиксации пока мы спрятаны (НЕПРЕРЫВНО)
+                        task.spawn(function()
+                            while isHidingUnderground and _G.BBN_Running do
+                                if hrp and hrp.Parent then
+                                    hrp.Anchored = true
+                                    hrp.Velocity = Vector3.new(0, 0, 0)
+                                    -- Принудительно держим наверху
+                                    if hrp.Position.Y < targetY - 2 then
+                                        hrp.CFrame = CFrame.new(hrp.Position.X, targetY, hrp.Position.Z)
+                                    end
+                                end
+                                task.wait(0.1) -- Частота фиксации выше
+                            end
+                        end)
+                    else
+                        hrp.Velocity = Vector3.new(0, 60, 0)
+                        hrp.CFrame = hrp.CFrame * CFrame.new(0, 1, 0) -- Принудительное смещение для надежности
+                    end
+                end
+            end
+        end)
+
+        print("Fly up started to Y: " .. targetY)
+    end
+end
+
+local function stopFly()
+    isFlying = false
+    flyDirection = nil
+    if flyConnection then
+        flyConnection:Disconnect()
+        flyConnection = nil
+    end
+    local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.Velocity = Vector3.new(0, 0, 0)
+        hrp.Anchored = false
+    end
+    print("Fly stopped.")
+end
+
+local function stopFlyAndFreeze()
+    isFlying = false
+    flyDirection = nil
+    if flyConnection then
+        flyConnection:Disconnect()
+        flyConnection = nil
+    end
+    local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.Velocity = Vector3.new(0, 0, 0)
+        hrp.Anchored = true
+    end
+    print("Fly stopped and anchored.")
+end
+
+local function getFuseboxTeleportCFrame(fb, fbPart)
+    local pos = fb and fb:FindFirstChild("Position")
+    if pos and pos:IsA("BasePart") then
+        -- Пользовательская точка «напротив FuseBox» внутри модели
+        return pos.CFrame
+    end
+    return fbPart and fbPart.CFrame or nil
+end
+
+local function goUnderground()
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp and not isHidingUnderground and not isFlying then
+        -- Определяем текущую карту
+        local currentMap = detectMap()
+
+        -- Если мы на поверхности (Y > -10 и < 50) или позиция еще не сохранена - сохраняем
+        -- Ограничение < 50 нужно, чтобы не сохранить позицию в небе на карте Forest
+        if not originalPosBeforeHide or (hrp.Position.Y > -10 and hrp.Position.Y < 50) or currentMap == "Warehouse" then
+            originalPosBeforeHide = hrp.Position
+            print("Saving surface position: " .. tostring(originalPosBeforeHide))
+        end
+        
+        isHidingUnderground = true 
+        _G.BBN_Status = "Hiding"
+        hideStartTime = tick()
+
+        -- ВЫХОДИМ ИЗ ГЕНЕРАТОРА ПЕРЕД СКРЫТИЕМ
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+            task.wait(0.05)
+            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+            task.wait(0.05)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+        end)
+
+        -- Определяем текущую карту
+        local currentMap = detectMap()
+
+        -- Для Forest летим вверх до Y=100 (как раньше)
+        if currentMap == "Forest" then
+            print("Forest map - flying UP to y100")
+
+            -- Отключаем коллизию для всех частей персонажа
+            for _, part in pairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = false
+                end
+            end
+
+            -- Летим вверх до y100
+            startFlyUp(100)
+
+            -- Поворачиваем камеру вверх
+            smoothAim(hrp.Position + Vector3.new(0, 10, 0), 0.4)
+        else
+            -- Для других карт - делаем объекты прозрачными и летим вниз
+            makeObjectsTransparent()
+
+            -- Отключаем коллизию для всех частей персонажа
+            for _, part in pairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = false
+                end
+            end
+
+            -- Летим глубоко вниз (на MIN_DEPTH_Y)
+            local targetDepth = MIN_DEPTH_Y
+
+            -- Запускаем полёт вниз
+            startFlyDown(targetDepth)
+
+            print("Flying deep underground to Y: " .. targetDepth)
+
+            -- Поворачиваем камеру вниз
+            smoothAim(hrp.Position + Vector3.new(0, -10, 0), 0.4)
+        end
+    end
+end
+
+local function returnToSurface()
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp and originalPosBeforeHide then
+        print("Returning to surface...")
+        _G.BBN_Status = "Exiting"
+
+        -- Снимаем якорь и останавливаем полёт ПЕРЕД ТЕЛЕПОРТОМ
+        isHidingUnderground = false
+        isFlying = false
+        flyDirection = nil
+        
+        if flyConnection then
+            flyConnection:Disconnect()
+            flyConnection = nil
+        end
+        
+        -- Якорим перед ТП, чтобы не провалиться в момент перемещения
+        hrp.Anchored = true
+        hrp.Velocity = Vector3.new(0, 0, 0)
+        
+        -- Телепортируем на исходную позицию
+        hrp.CFrame = CFrame.new(originalPosBeforeHide + Vector3.new(0, 2.5, 0))
+        
+        -- СБРОС КАМЕРЫ: Возвращаем управление игроку
+        local cam = Workspace.CurrentCamera
+        cam.CameraType = Enum.CameraType.Custom
+        if currentTween then currentTween:Cancel() end
+        
+        -- СНАЧАЛА ВОССТАНАВЛИВАЕМ КОЛЛИЗИЮ И ПРОЗРАЧНОСТЬ
+        restoreObjectsTransparency()
+        toggleNoclip(false)
+        
+        for _, part in pairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = true
+            end
+        end
+
+        task.wait(0.3) -- Даем время движку Roblox просчитать пол под нами
+        
+        -- ТОЛЬКО ПОТОМ СНИМАЕМ ЯКОРЬ
+        hrp.Anchored = false
+        hrp.Velocity = Vector3.new(0, 0, 0)
+        
+        -- Сбрасываем состояние и ставим кулдаун
+        originalPosBeforeHide = nil
+        justReturnedFromUnderground = true
+        
+        -- Дожимаем F после возврата, если мы на генераторе
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+            task.wait(0.05)
+            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+        end)
+
+        task.spawn(function()
+            task.wait(RETURN_COOLDOWN)
+            justReturnedFromUnderground = false
+            _G.BBN_Status = "Idle"
+        end)
+
+        print("Returned to surface!")
+    end
+end
+
+local function ascendToSurface()
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp and originalPosBeforeHide then
+        print("Ascending back to surface...")
+        _G.BBN_Status = "Exiting"
+
+        -- Останавливаем флай и снимаем якорь ПЕРЕД ТЕЛЕПОРТОМ
+        isHidingUnderground = false
+        isFlying = false
+        flyDirection = nil
+        
+        if flyConnection then
+            flyConnection:Disconnect()
+            flyConnection = nil
+        end
+        
+        hrp.Anchored = false
+        hrp.Velocity = Vector3.new(0, 0, 0)
+
+        -- СБРОС КАМЕРЫ
+        local cam = Workspace.CurrentCamera
+        cam.CameraType = Enum.CameraType.Custom
+        if currentTween then currentTween:Cancel() end
+
+        -- Определяем текущую карту
+        local currentMap = detectMap()
+
+        if currentMap == "Forest" then
+            -- Для Forest телепортируемся обратно
+            hrp.CFrame = CFrame.new(originalPosBeforeHide + Vector3.new(0, 2.5, 0))
+
+            -- Восстанавливаем коллизию персонажа
+            for _, part in pairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = true
+                end
+            end
+            
+            task.wait(0.3)
+            hrp.Anchored = false
+
+            -- Сбрасываем состояние
+            originalPosBeforeHide = nil
+            justReturnedFromUnderground = true
+            
+            -- Дожимаем F
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+                task.wait(0.05)
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+            end)
+
+            task.spawn(function()
+                task.wait(RETURN_COOLDOWN)
+                justReturnedFromUnderground = false
+                _G.BBN_Status = "Idle"
+            end)
+
+            print("Returned to surface on Forest!")
+        else
+            -- Для других карт
+            toggleNoclip(true)
+            makeObjectsTransparent()
+
+            -- Якорим перед ТП
+            hrp.Anchored = true
+            hrp.Velocity = Vector3.new(0, 0, 0)
+
+            -- Телепортируем на исходную позицию (чуть выше)
+            hrp.CFrame = CFrame.new(originalPosBeforeHide + Vector3.new(0, 2.5, 0))
+
+            -- СНАЧАЛА ВОССТАНАВЛИВАЕМ ВСЁ
+            restoreObjectsTransparency()
+            toggleNoclip(false)
+
+            for _, part in pairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = true
+                end
+            end
+
+            -- Ждём для стабилизации физики
+            task.wait(0.3)
+            
+            -- ТОЛЬКО В КОНЦЕ СНИМАЕМ ЯКОРЬ
+            hrp.Anchored = false
+
+            -- Сбрасываем состояние
+            originalPosBeforeHide = nil
+            justReturnedFromUnderground = true
+            
+            -- Дожимаем F
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+                task.wait(0.05)
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+            end)
+
+            task.spawn(function()
+                task.wait(RETURN_COOLDOWN)
+                justReturnedFromUnderground = false
+                _G.BBN_Status = "Idle"
+            end)
+
+            print("Ascended to surface via teleport!")
+        end
+    end
+end
+
+--- Выход из режима пряток с восстановлением коллизий/камеры и телепорт в точку (safe zone или exit), без «зависания» в воздухе
+local function cleanupHidingAndTeleportTo(targetPos)
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+
+    isHidingUnderground = false
+    isFlying = false
+    flyDirection = nil
+    if flyConnection then
+        flyConnection:Disconnect()
+        flyConnection = nil
+    end
+
+    hrp.Velocity = Vector3.new(0, 0, 0)
+
+    local cam = Workspace.CurrentCamera
+    cam.CameraType = Enum.CameraType.Custom
+    if currentTween then currentTween:Cancel() end
+
+    restoreObjectsTransparency()
+    toggleNoclip(false)
+
+    for _, part in pairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanCollide = true
+        end
+    end
+
+    hrp.Anchored = true
+    hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
+    task.wait(0.28)
+    hrp.Anchored = false
+    hrp.Velocity = Vector3.new(0, 0, 0)
+
+    originalPosBeforeHide = nil
+    justReturnedFromUnderground = true
+    task.spawn(function()
+        task.wait(RETURN_COOLDOWN)
+        justReturnedFromUnderground = false
+    end)
+
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+    end)
+
+    return true
+end
+
+local function forceReturnFromHide(currentMap)
+    if currentMap == "Forest" then
+        ascendToSurface()
+    else
+        returnToSurface()
+    end
+
+    -- Fallback: если исходная позиция потерялась и обычный возврат не выполнился.
+    if isHidingUnderground or isFlying then
+        local char = player.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            isHidingUnderground = false
+            isFlying = false
+            stopFly()
+            restoreObjectsTransparency()
+            toggleNoclip(false)
+            for _, part in pairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = true
+                end
+            end
+
+            local targetY = (hrp.Position.Y < 0) and math.max(4, hrp.Position.Y + 55) or (hrp.Position.Y + 8)
+            hrp.Anchored = true
+            hrp.CFrame = CFrame.new(hrp.Position.X, targetY, hrp.Position.Z)
+            task.wait(0.2)
+            hrp.Anchored = false
+            hrp.Velocity = Vector3.new(0, 0, 0)
+
+            originalPosBeforeHide = nil
+            justReturnedFromUnderground = true
+            task.spawn(function()
+                task.wait(RETURN_COOLDOWN)
+                justReturnedFromUnderground = false
+            end)
+        end
+    end
+end
+
+-- ========== ПОЛНАЯ ОЧИСТКА ГУИ ==========
+local function nuclearCleanup()
+    local wasRunning = _G.BBN_Running
+    _G.BBN_Running = false
+    _G.BBN_Status = "Off"
+    allEspEnabled, autoGenEnabled, autoCursorEnabled, spiritEnabled = false, false, false, false
+    states["ESP ALL"] = false
+    espLiveToken = espLiveToken + 1
+    local offTok = espLiveToken
+    cancelEspLoopThread()
+
+    if spiritConn then spiritConn:Disconnect() spiritConn = nil end
+    if inputConnection then inputConnection:Disconnect() inputConnection = nil end
+    if noclipConnection then noclipConnection:Disconnect() noclipConnection = nil end
+    if flyConnection then flyConnection:Disconnect() flyConnection = nil end
+
+    -- Останавливаем флай и сбрасываем состояние персонажа только если он был активен
+    isFlying = false
+    isHidingUnderground = false
+    flyDirection = nil
+    
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp and wasRunning then
+        hrp.Anchored = false
+        hrp.Velocity = Vector3.new(0, 0, 0)
+    end
+    
+    -- Восстанавливаем коллизию и прозрачность только если мы их меняли
+    if wasRunning then
+        restoreObjectsTransparency()
+        toggleNoclip(false)
+        
+        if char then
+            for _, part in pairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = true
+                end
+            end
+        end
+    end
+    
+    for _, v in ipairs(CoreGui:GetChildren()) do
+        if v.Name == "BiteByNightMenu" or v.Name == "BBN_Loading" or v.Name == "BBN_AutoWinLogs" then
+            v:Destroy()
+        end
+    end
+    
+    clearEsp()
+    local function espPurgeNuclear()
+        if offTok ~= espLiveToken then return end
+        clearEsp()
+    end
+    task.defer(espPurgeNuclear)
+
+    local wipe = {}
+    local allw = Workspace:GetDescendants()
+    for i = 1, #allw do
+        local obj = allw[i]
+        if string.find(obj.Name, "BBN_", 1, true) then
+            wipe[#wipe + 1] = obj
+        end
+        if i % 4000 == 0 then task.wait() end
+    end
+    destroyInstanceList(wipe)
+end
+nuclearCleanup()
+task.wait(0.1) -- Небольшая пауза перед запуском нового
+_G.BBN_Running = true
+
+local function toggleAutoGen(enable)
+    autoGenEnabled = enable
+    if not enable then 
+        _G.BBN_Status = "Stopped"
+        print("Stopping Auto Farm/Gen and cleaning up...")
+        
+        -- Сброс камеры
+        local cam = Workspace.CurrentCamera
+        cam.CameraType = Enum.CameraType.Custom
+        if currentTween then currentTween:Cancel() end
+        
+        -- Отпускаем клавиши
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.W, false, game)
+        end)
+        
+        -- Если мы прятались - возвращаемся (или просто сбрасываем флаги)
+        if isHidingUnderground or isFlying then
+            local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then hrp.Anchored = false end
+            isHidingUnderground = false
+            isFlying = false
+            stopFly()
+            restoreObjectsTransparency()
+            toggleNoclip(false)
+        end
+        
+        return 
+    end
+    task.spawn(function() 
+        local lastRepairTime = 0
+        local lastMiniGameTime = 0
+        local repairCooldown = math.random(5, 7)
+        local currentRepairTargetGen = nil
+        local returningFromSafety = false
+        local interactionRetryTime = 0
+        local inSafeZoneWaiting = false
+        local safeZoneRoutineStart = 0
+        local cameraMovedInSafeZone = false
+        local fPressedInSafeZone = false
+        local isEscaping = false
+        local batterySearchStart = 0
+        local lastPizzeriaExitHop = 0
+        local lastHideSafeRelocateTime = 0
+        local lastFuseboxNudge = 0
+        local lastCarryBatteryCheck = 0
+        local lastCarryBatteryValue = false
+        local lastSafeZoneTeleportAt = 0
+        
+        -- Для отслеживания попыток на генераторе
+        local currentPromptIndex = 1
+        local currentPointIndex = 1
+        
+        -- === SYSTEM PROTECTION FUNCTION ===
+        -- getKillerDist теперь глобальный
+
+        -- Высокочастотный поток защиты (реакция 60 раз в секунду)
+        task.spawn(function()
+            while autoGenEnabled and _G.BBN_Running do
+                local char = player.Character
+                local isKiller = false
+                local locallyInLobby = false
+                
+                -- 1. Проверка на маньяка (чтобы не прятаться самого от себя)
+                local playersFolder = Workspace:FindFirstChild("PLAYERS")
+                if playersFolder and char then
+                    local parent = char.Parent
+                    if parent then
+                        local pName = parent.Name:upper()
+                        if pName == "KILLER" then isKiller = true 
+                        elseif pName == "LOBBY" then locallyInLobby = true end
+                    end
+                end
+                
+                -- 2. Дополнительные проверки на роль и карту
+                if not isKiller and char and char:GetAttribute("Role") == "Killer" then isKiller = true end
+                if not locallyInLobby and detectMap() == "Waiting..." then locallyInLobby = true end
+
+                -- ЗАЩИТА СРАБАТЫВАЕТ ТОЛЬКО В ИГРЕ
+                if not isKiller and not locallyInLobby and (states["AUTO FARM"] or states["AUTO GEN"]) then
+                    local killerDist = getKillerDist()
+                    
+                    -- Логика скрытия (Killer < 55m)
+                    if killerDist < 55 and not justReturnedFromUnderground and not isEscaping then
+                        if not isHidingUnderground and not isFlying then
+                            print("REACTION! Killer at " .. math.floor(killerDist) .. "m. Hiding.")
+                            _G.BBN_Status = "Hiding"
+                            pcall(function() 
+                                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+                                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+                            end)
+                            goUnderground()
+                        end
+                    end
+                    
+                    -- Логика возврата (Killer > 85-110m)
+                    local currentMap = detectMap()
+                    local canReturn = false
+                    
+                    if currentMap == "Forest" then
+                        -- Для Forest проверяем дистанцию маньяка от ЦЕЛИ (генератора), а не от нас в воздухе
+                        local targetPos = currentRepairTargetGen and (currentRepairTargetGen:IsA("BasePart") and currentRepairTargetGen.Position or currentRepairTargetGen:FindFirstChildWhichIsA("BasePart", true) and currentRepairTargetGen:FindFirstChildWhichIsA("BasePart", true).Position)
+                        if targetPos then
+                            local killerHRP = nil
+                            local killerFolder = Workspace:FindFirstChild("PLAYERS") and Workspace.PLAYERS:FindFirstChild("KILLER")
+                            local killerObj = killerFolder and killerFolder:FindFirstChildWhichIsA("Model")
+                            killerHRP = killerObj and (killerObj:FindFirstChild("HumanoidRootPart") or killerObj:FindFirstChildWhichIsA("BasePart", true))
+                            
+                            if killerHRP then
+                                local distFromGen = (targetPos - killerHRP.Position).Magnitude
+                                if distFromGen >= 65 then canReturn = true end
+                            else
+                                canReturn = true -- Маньяк не найден
+                            end
+                        else
+                            -- Если цели нет, используем стандартную дистанцию от игрока
+                            if killerDist >= 120 and killerDist ~= 1000 then canReturn = true end
+                        end
+                    else
+                        -- Для других карт стандартная логика
+                        local returnDist = 85
+                        if killerDist >= returnDist or killerDist == 1000 then canReturn = true end
+                    end
+
+                    -- Не выходим из hide слишком рано: даём долететь до безопасной высоты/глубины.
+                    if canReturn and hideStartTime > 0 and (tick() - hideStartTime) >= 2.4 then
+                        if currentMap == "Forest" and hrp and hrp.Position.Y < 95 then
+                            canReturn = false
+                        end
+                    else
+                        canReturn = false
+                    end
+
+                    if canReturn then
+                        if isHidingUnderground or isFlying then
+                            print("Killer far enough. Returning.")
+                            forceReturnFromHide(currentMap)
+                        end
+                    end
+                end
+                RunService.Heartbeat:Wait()
+            end
+        end)
+
+        while autoGenEnabled and _G.BBN_Running do
+            local char = player.Character
+            local hum = char and char:FindFirstChild("Humanoid")
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            
+            local isSurvivor = char and char.Parent and (char.Parent.Name == "ALIVE" or char.Parent.Name == "PLAYERS")
+            local currentMap = detectMap()
+            
+            -- ПРОВЕРКА РОЛИ
+            local isKiller = false
+            local isInLobby = (currentMap == "Waiting...")
+            
+            local playersFolder = Workspace:FindFirstChild("PLAYERS")
+            if playersFolder and char then
+                local parent = char.Parent
+                if parent then
+                    local parentName = parent.Name:upper()
+                    if parentName == "LOBBY" then isInLobby = true
+                    elseif parentName == "KILLER" then isKiller = true end
+                end
+            end
+            
+            -- Если я маньяк - просто пишем Playing и больше ничего не делаем
+            if isKiller then
+                _G.BBN_Status = "Playing"
+                task.wait(1)
+                continue
+            end
+            
+            -- Если я в лобби - сбрасываем счетчик генов
+            if isInLobby then
+                _G.BBN_GensRepaired = 0
+                _G.BBN_Status = "Lobby"
+                usedPizzeriaExits = {} -- Сброс использованных выходов Pizzeria при возврате в лобби
+                usedForestExits = {} -- Сброс использованных выходов Forest при возврате в лобби
+            end
+            
+            -- AUTO FARM делает ВСЁ: защита, телепорты, поиск целей
+            if states["AUTO FARM"] and not isKiller and not isInLobby and isSurvivor and hrp and hum and currentMap ~= "Waiting..." then
+                
+                -- === SYSTEM PROTECTION CHECK ===
+                -- В прятках ничего не телепортируем: только корректно уходим в hide и ждём возврата по дистанции маньяка.
+                if (isHidingUnderground or isFlying) and not isEscaping then
+                    local minsWhileHidden = getGameTime()
+                    if minsWhileHidden >= 360 and minsWhileHidden < 1000 then
+                        -- В 6AM не застреваем в hide-ветке: сразу запускаем escape.
+                        isEscaping = true
+                        isHidingUnderground = false
+                        isFlying = false
+                        stopFly()
+                    end
+                    local targetReached = false
+                    if currentMap == "Forest" then
+                        if hrp.Position.Y >= 100 then targetReached = true end
+                    else
+                        if hrp.Position.Y <= (originalPosBeforeHide and originalPosBeforeHide.Y - 4 or -20) or hrp.Position.Y <= MIN_DEPTH_Y + 5 then targetReached = true end
+                    end
+
+                    if not targetReached then
+                        _G.BBN_Status = "Moving to Hideout"
+                    else
+                        _G.BBN_Status = "Hidden"
+                    end
+                    task.wait(0.5)
+                    continue
+                end
+
+                -- ПРОВЕРКА ОДИНОЧНОГО ВЫЖИВАНИЯ
+                local aliveFolder = Workspace:FindFirstChild("PLAYERS") and Workspace.PLAYERS:FindFirstChild("ALIVE")
+                local survivors = aliveFolder and aliveFolder:GetChildren() or {}
+                local isSolo = (#survivors == 1 and survivors[1].Name == player.Name)
+                local totalMinsCheck = getGameTime()
+                
+                    if isSolo and totalMinsCheck < 360 and not isEscaping then
+                    _G.BBN_Status = "Solo: Waiting 6AM"
+                    if canTeleport(true, true) then
+                        local distToSafe = (hrp.Position - safeZoneFinalPos).Magnitude
+                        local safeCdReady = (tick() - lastSafeZoneTeleportAt) >= TELEPORT_COOLDOWN
+                        if distToSafe > 10 and safeCdReady then
+                            print("Solo survivor! Teleporting to safe zone.")
+                            hrp.CFrame = CFrame.new(safeZoneFinalPos)
+                            markTeleport()
+                            lastSafeZoneTeleportAt = tick()
+                        end
+                    end
+                    task.wait(1)
+                    continue
+                end
+
+                -- ПРОВЕРКА ВРЕМЕНИ (6 AM)
+                local totalMins = getGameTime()
+                if totalMins >= 360 and totalMins < 1000 then
+                    if not isEscaping then
+                        print("It's 6 AM! Prioritizing escape.")
+                        isEscaping = true
+                        -- Сброс всех состояний скрытия для побега
+                        isHidingUnderground = false
+                        isFlying = false
+                        stopFly()
+                        if hrp then hrp.Anchored = false end
+                        
+                        pcall(function() 
+                            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+                            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+                        end)
+                    end
+                elseif totalMins < 360 then
+                    if isEscaping then
+                        print("Time is before 6 AM. Resetting escape state.")
+                        isEscaping = false
+                    end
+                end
+
+                -- === HELPER FUNCTIONS FOR ESCAPE ===
+                local function checkEscapeSuccess()
+                    local char = player.Character
+                    if not char then return false end
+
+                    -- Проверка 1: Роль изменилась на Lobby
+                    local parent = char.Parent
+                    if parent and parent.Name:upper() == "LOBBY" then
+                        return true
+                    end
+
+                    -- Проверка 2: Карта изменилась на Waiting...
+                    if detectMap() == "Waiting..." then
+                        return true
+                    end
+
+                    return false
+                end
+
+                local function flyToExit(targetPos, map)
+                    local char = player.Character
+                    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                    if not hrp then return false end
+
+                    print("Flying to exit at: " .. tostring(targetPos))
+
+                    -- Включаем прозрачность объектов
+                    makeObjectsTransparent()
+
+                    -- Определяем высоту/глубину прятки в зависимости от карты
+                    local hideY
+                    if map == "Pizzeria" then
+                        hideY = MIN_DEPTH_Y  -- Вниз (как при прятках)
+                    elseif map == "Forest" then
+                        hideY = 100  -- Вверх (как при прятках)
+                    else
+                        hideY = MIN_DEPTH_Y  -- По умолчанию вниз
+                    end
+
+                    -- Шаг 1: Летим по Y до высоты/глубины прятки
+                    _G.BBN_Status = "Flying to hide level..."
+                    if map == "Forest" then
+                        startFlyUp(hideY)
+                    else
+                        startFlyDown(hideY)
+                    end
+
+                    -- Ждем пока достигнем нужной высоты
+                    local timeout = tick() + 15
+                    while isFlying and tick() < timeout do
+                        task.wait(0.1)
+                    end
+
+                    if tick() >= timeout then
+                        print("Timeout waiting for Y movement")
+                        restoreObjectsTransparency()
+                        return false
+                    end
+
+                    -- Шаг 2: Летим по X и Z к выходу (на той же высоте)
+                    _G.BBN_Status = "Flying to exit X/Z..."
+                    hrp.Anchored = false
+
+                    local targetXZ = Vector3.new(targetPos.X, hrp.Position.Y, targetPos.Z)
+                    local startTime = tick()
+
+                    while (hrp.Position - targetXZ).Magnitude > 5 and tick() - startTime < 20 do
+                        local direction = (targetXZ - hrp.Position).Unit
+                        hrp.Velocity = direction * 50
+                        hrp.CFrame = hrp.CFrame + direction * 2
+                        task.wait(0.05)
+
+                        -- Проверка успешности побега
+                        if checkEscapeSuccess() then
+                            print("Escape successful during X/Z movement!")
+                            restoreObjectsTransparency()
+                            return true
+                        end
+                    end
+
+                    -- Шаг 3: Летим по Y к выходу (вниз или вверх в зависимости от карты)
+                    _G.BBN_Status = "Flying to exit Y..."
+
+                    if map == "Forest" then
+                        -- Forest: летим вниз к выходу
+                        startFlyDown(targetPos.Y)
+                    else
+                        -- Pizzeria: летим вверх к выходу
+                        startFlyUp(targetPos.Y)
+                    end
+
+                    -- Ждем пока достигнем выхода
+                    timeout = tick() + 15
+                    while isFlying and tick() < timeout do
+                        task.wait(0.1)
+
+                        -- Проверка успешности побега
+                        if checkEscapeSuccess() then
+                            print("Escape successful during final Y movement!")
+                            restoreObjectsTransparency()
+                            return true
+                        end
+                    end
+
+                    -- Финальная телепортация к точке выхода
+                    hrp.CFrame = CFrame.new(targetPos)
+                    task.wait(2)
+
+                    restoreObjectsTransparency()
+                    return checkEscapeSuccess()
+                end
+
+                -- === FLY TO TARGET (Generators/Batteries) ===
+                local function flyToTarget(targetPos, targetName)
+                    local char = player.Character
+                    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                    if not hrp then return false end
+
+                    -- ПРОВЕРКА: Не летим если мы в Safe Zone
+                    if inSafeZone then
+                        print("❌ Cannot fly from Safe Zone! Use teleport instead.")
+                        return false
+                    end
+
+                    print("🚀 Flying to " .. targetName .. " at: " .. tostring(targetPos))
+
+                    -- Включаем прозрачность объектов
+                    makeObjectsTransparent()
+
+                    -- Определяем карту и высоту (КАК ПРИ ПРЯТКАХ)
+                    local map = detectMap()
+                    local hideY
+
+                    if map == "Forest" then
+                        hideY = 100  -- Вверх для Forest (как при прятках)
+                    elseif map == "Warehouse" or map == "Pizzeria" or map == "Minefield" or map == "Gulag" then
+                        hideY = MIN_DEPTH_Y  -- Вниз для Warehouse, Pizzeria и других (-70)
+                    else
+                        hideY = MIN_DEPTH_Y  -- По умолчанию вниз для всех остальных (-70)
+                    end
+
+                    print("Map: " .. map .. " | Hide Y: " .. hideY)
+
+                    -- Шаг 1: Летим по Y до высоты прятки
+                    _G.BBN_Status = "Flying Y to hide level..."
+                    print("Step 1: Flying to Y=" .. hideY)
+
+                    if map == "Forest" then
+                        startFlyUp(hideY)
+                    else
+                        startFlyDown(hideY)
+                    end
+
+                    -- Ждем достижения высоты с постоянной проверкой
+                    local timeout = tick() + 20  -- Увеличил таймаут для Forest
+                    local lastHeightCheck = tick()
+
+                    while isFlying and tick() < timeout do
+                        task.wait(0.1)
+
+                        -- Проверка высоты каждые 3 секунды
+                        if tick() - lastHeightCheck >= 3 then
+                            local currentY = hrp.Position.Y
+                            print("⏱️ Height check: Current Y=" .. math.floor(currentY) .. " | Target Y=" .. hideY)
+                            lastHeightCheck = tick()
+                        end
+
+                        -- Проверка высоты - достигли ли нужной Y?
+                        local currentY = hrp.Position.Y
+                        local heightReached = false
+
+                        if map == "Forest" then
+                            -- Для Forest проверяем что поднялись достаточно высоко
+                            if currentY >= hideY - 3 then  -- Уменьшил допуск с 5 до 3 для точности
+                                heightReached = true
+                            end
+                        else
+                            -- Для остальных карт проверяем что опустились достаточно низко
+                            if currentY <= hideY + 3 then
+                                heightReached = true
+                            end
+                        end
+
+                        if heightReached then
+                            print("✅ Height check passed: Y=" .. math.floor(currentY) .. " (target: " .. hideY .. ")")
+                            -- Останавливаем полет и фиксируем на нужной высоте
+                            stopFlyAndFreeze()
+                            hrp.CFrame = CFrame.new(hrp.Position.X, hideY, hrp.Position.Z)
+                            hrp.Anchored = true
+                            task.wait(0.2)  -- Небольшая пауза для стабилизации
+                            break
+                        end
+
+                        -- Проверка на маньяка
+                        if getKillerDist() < 55 then
+                            print("❌ Killer approaching during fly! Aborting.")
+                            restoreObjectsTransparency()
+                            stopFly()
+                            return false
+                        end
+                    end
+
+                    if tick() >= timeout then
+                        print("❌ Timeout waiting for Y movement. Current Y: " .. hrp.Position.Y .. " Target: " .. hideY)
+                        restoreObjectsTransparency()
+                        stopFly()
+                        return false
+                    end
+
+                    print("✅ Reached hide level Y=" .. hrp.Position.Y)
+
+                    -- АНТИ-AFK: Фальшивые движения во время полета
+                    local function sendFakeMovement()
+                        pcall(function()
+                            -- Имитируем нажатия клавиш движения
+                            local keys = {Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D}
+                            local randomKey = keys[math.random(1, #keys)]
+
+                            VirtualInputManager:SendKeyEvent(true, randomKey, false, game)
+                            task.wait(0.05)
+                            VirtualInputManager:SendKeyEvent(false, randomKey, false, game)
+                        end)
+                    end
+
+                    -- Шаг 2: Летим по X и Z к цели (ПЛАВНЫЙ ПОЛЕТ + АНТИ-AFK)
+                    _G.BBN_Status = "Flying X/Z to " .. targetName .. "..."
+                    print("Step 2: Flying X/Z to target")
+                    hrp.Anchored = false
+
+                    local targetXZ = Vector3.new(targetPos.X, hrp.Position.Y, targetPos.Z)
+                    local startTime = tick()
+                    local lastFakeMove = tick()
+                    local lastHeightCheck = tick()
+
+                    -- Скорость зависит от карты
+                    local flySpeed = 60  -- Увеличил базовую скорость с 45 до 60
+                    if map == "Forest" then
+                        flySpeed = 65  -- Forest еще быстрее
+                    elseif map == "Warehouse" then
+                        flySpeed = 70  -- Warehouse самый быстрый (против телепорта назад)
+                    end
+
+                    local smoothness = 0.85  -- Увеличил плавность с 0.8 до 0.85
+
+                    while (hrp.Position - targetXZ).Magnitude > 5 and tick() - startTime < 25 do
+                        local direction = (targetXZ - hrp.Position).Unit
+
+                        -- ПЛАВНОЕ движение через Velocity (без резких CFrame скачков)
+                        local currentVel = hrp.Velocity
+                        local targetVel = direction * flySpeed
+                        hrp.Velocity = currentVel:Lerp(targetVel, smoothness)  -- Плавная интерполяция
+
+                        -- Проверка высоты каждые 3 секунды (особенно важно для Forest)
+                        if tick() - lastHeightCheck >= 3 then
+                            local currentY = hrp.Position.Y
+                            print("⏱️ X/Z Height check: Y=" .. math.floor(currentY) .. " | Should be: " .. hideY)
+
+                            -- Если отклонились от высоты - корректируем
+                            if math.abs(currentY - hideY) > 10 then
+                                print("⚠️ Height deviation detected! Correcting...")
+                                hrp.CFrame = CFrame.new(hrp.Position.X, hideY, hrp.Position.Z)
+                                hrp.Anchored = true
+                                task.wait(0.1)
+                                hrp.Anchored = false
+                            end
+
+                            lastHeightCheck = tick()
+                        end
+
+                        -- Отправляем фальшивые движения каждые 0.5 сек
+                        if tick() - lastFakeMove > 0.5 then
+                            sendFakeMovement()
+                            lastFakeMove = tick()
+                        end
+
+                        task.wait(0.05)
+
+                        -- Проверка на маньяка
+                        if getKillerDist() < 55 then
+                            print("❌ Killer approaching during X/Z fly! Aborting.")
+                            restoreObjectsTransparency()
+                            hrp.Anchored = false
+                            return false
+                        end
+                    end
+
+                    print("✅ Reached X/Z position")
+
+                    -- Шаг 3: Летим по Y к цели (НЕМНОГО ВЫШЕ)
+                    _G.BBN_Status = "Flying Y to " .. targetName .. "..."
+                    print("Step 3: Flying to final Y=" .. (targetPos.Y + 3))
+
+                    local finalY = targetPos.Y + 3  -- На 3 единицы выше цели
+
+                    if map == "Forest" then
+                        startFlyDown(finalY)
+                    else
+                        startFlyUp(finalY)
+                    end
+
+                    -- Ждем достижения цели
+                    timeout = tick() + 15
+                    while isFlying and tick() < timeout do
+                        task.wait(0.1)
+
+                        -- Проверка высоты - достигли ли финальной Y?
+                        local currentY = hrp.Position.Y
+                        if map == "Forest" then
+                            -- Для Forest летим вниз к цели
+                            if currentY <= finalY + 5 then
+                                print("✅ Final height check passed: Y=" .. currentY .. " (target: " .. finalY .. ")")
+                                break
+                            end
+                        else
+                            -- Для остальных карт летим вверх к цели
+                            if currentY >= finalY - 5 then
+                                print("✅ Final height check passed: Y=" .. currentY .. " (target: " .. finalY .. ")")
+                                break
+                            end
+                        end
+
+                        -- Проверка на маньяка
+                        if getKillerDist() < 55 then
+                            print("❌ Killer approaching during final Y fly! Aborting.")
+                            restoreObjectsTransparency()
+                            stopFly()
+                            return false
+                        end
+                    end
+
+                    if tick() >= timeout then
+                        print("❌ Timeout on final Y. Current: " .. hrp.Position.Y .. " Target: " .. finalY)
+                    end
+
+                    -- Финальная позиция (немного выше цели)
+                    hrp.CFrame = CFrame.new(targetPos.X, targetPos.Y + 2, targetPos.Z)
+                    hrp.Anchored = false  -- Отключаем фиксацию
+                    hrp.Velocity = Vector3.new(0, 0, 0)
+
+                    -- Финальное фальшивое движение
+                    sendFakeMovement()
+
+                    restoreObjectsTransparency()
+                    print("✅ Arrived at " .. targetName .. " at Y=" .. hrp.Position.Y)
+                    return true
+                end
+
+                -- === ESCAPE SYSTEM (6 AM) ===
+                if isEscaping then
+                    local currentTotalMins = getGameTime()
+                    if currentTotalMins < 360 then
+                        print("Forbidden to escape before 6 AM!")
+                        isEscaping = false
+                        continue
+                    end
+                    
+                    _G.BBN_Status = "Escaping!"
+                    
+                    -- Проверка не в лобби ли мы уже
+                    if currentMap == "Waiting..." or isInLobby then
+                        isEscaping = false
+                        print("Already in Lobby, stopping escape system.")
+                        continue
+                    end
+
+                    local map = detectMap()
+                    local targetExitPos = nil
+                    local exitName = "Exit"
+                    local forestExitIndex = nil  -- Для отслеживания какой выход Forest
+
+                    if map == "Pizzeria" then
+                        targetExitPos = nextPizzeriaExitPosition()
+                        exitName = "Pizzeria Exit"
+                    elseif map == "Forest" then
+                        targetExitPos, forestExitIndex = nextForestExitPosition()
+                        exitName = "Forest Exit #" .. forestExitIndex
+                    elseif map == "Warehouse" then
+                        targetExitPos = warehouseExitFinalPos
+                        exitName = "Warehouse Exit"
+                    else
+                        -- Динамический поиск для других карт
+                        local currentFound = findObjects()
+                        if currentFound and currentFound.escapePoints and #currentFound.escapePoints > 0 then
+                            local exit = currentFound.escapePoints[math.random(1, #currentFound.escapePoints)]
+                            targetExitPos = exit.Position or (exit:IsA("BasePart") and exit.Position)
+                            exitName = exit.Name or "Found Exit"
+                        else
+                            targetExitPos = getExitPos()
+                            exitName = "Fallback Exit"
+                        end
+                    end
+
+                    if targetExitPos then
+                        _G.BBN_Status = "Trying Exit..."
+
+                        -- FOREST: Первый выход (индекс 1) - телепорт, второй выход (индекс 2) - Fly
+                        if map == "Forest" and forestExitIndex == 2 then
+                            print("Forest Exit #2: Using Fly system...")
+                            local success = flyToExit(targetExitPos, map)
+
+                            if success then
+                                print("Escape successful via Fly!")
+                                isEscaping = false
+                                continue
+                            else
+                                print("Fly escape failed, will retry...")
+                            end
+                        else
+                            -- Для всех остальных карт и Forest Exit #1 - телепорт
+                            if canTeleport(true, true) then
+                                if hrp then
+                                    hrp.Anchored = false
+                                    pcall(function() VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game) task.wait(0.05) VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game) end)
+                                    task.wait(0.1)
+                                end
+
+                                print("Teleporting to escape point: " .. exitName)
+
+                                -- СИЛОВОЙ ПОБЕГ: Если мы в нычке, принудительно выходим
+                                if isHidingUnderground or isFlying then
+                                    print("Forcing escape from hideout!")
+                                    hrp.Anchored = true
+                                    hrp.Velocity = Vector3.new(0, 0, 0)
+                                    restoreObjectsTransparency()
+                                    toggleNoclip(false)
+                                    hrp.CFrame = CFrame.new(targetExitPos + Vector3.new(0, 5, 0))
+                                    task.wait(0.1)
+                                    hrp.Anchored = false
+                                    markTeleport()
+                                else
+                                    hrp.CFrame = CFrame.new(targetExitPos + Vector3.new(0, 5, 0))
+                                    markTeleport()
+                                end
+
+                                task.wait(3) -- Ждем 3 секунды чтобы сработал триггер выхода
+
+                                -- Проверка успешности побега
+                                if checkEscapeSuccess() then
+                                    print("Escape successful via teleport!")
+                                    isEscaping = false
+                                    continue
+                                end
+
+                                -- Попытка 2: Если телепорт не сработал, используем Fly систему
+                                print("Teleport failed, trying Fly system...")
+
+                                -- Для Pizzeria используем Fly систему как fallback
+                                if map == "Pizzeria" then
+                                    local success = flyToExit(targetExitPos, map)
+
+                                    if success then
+                                        print("Escape successful via Fly!")
+                                        isEscaping = false
+                                        continue
+                                    else
+                                        print("Fly escape failed, will retry...")
+                                    end
+                                end
+                            end
+                        end
+                    end
+
+                    task.wait(1)
+                    continue
+                end
+
+                -- ЗАЩИТА ОТ ТЕЛЕПОРТА В SAFE ZONE ПРИ СТАРТЕ: Ждем пока прогрузятся объекты
+                if tick() - cachedObjects.lastUpdate > 2 then
+                    found = findObjects()
+                else
+                    found = cachedObjects.data
+                end
+
+                if #found.generators == 0 then
+                    _G.BBN_Status = "Waiting for assets..."
+                    task.wait(1) 
+                    continue
+                end
+
+                -- === SYSTEM PROTECTION ===
+                -- Return check handled in separate high-frequency thread
+                -- (Проверка пряток выше в блоке AUTO FARM — здесь дубликат не нужен)
+                if isMinionOnMe(found.minions, char, hrp) then
+                    _G.BBN_Status = "Minion on me! Shake"
+                    if not isHidingUnderground and not isFlying then
+                        goUnderground()
+                    end
+                    local function minionStillOnMe()
+                        local c = player.Character
+                        local r = c and c:FindFirstChild("HumanoidRootPart")
+                        if not c or not r then return false end
+                        local f = cachedObjects.data
+                        if tick() - cachedObjects.lastUpdate > 0.6 then
+                            f = findObjects()
+                        end
+                        return isMinionOnMe(f.minions, c, r)
+                    end
+                    shakeCameraRapid(5, minionStillOnMe)
+                    task.wait(0.05)
+                    continue
+                end
+
+                -- === SEARCH & TELEPORT LOGIC (AUTO FARM ONLY) ===
+                -- Кэшируем вызов findObjects на 2.5 секунды для Auto Farm
+                if tick() - cachedObjects.lastUpdate > 2.5 then
+                    found = findObjects()
+                else
+                    found = cachedObjects.data
+                end
+                
+                local killerDist = getKillerDist()
+                local isCarryingBattery = lastCarryBatteryValue
+
+                -- ПРИОРИТЕТ ЗАЩИТЫ: Если маньяк близко, блокируем ВСЕ действия фермы (кроме побега)
+                if killerDist < 60 and not isEscaping then
+                    if not isHidingUnderground and not isFlying then
+                        _G.BBN_Status = "Waiting for Hide"
+                        task.wait(0.1)
+                        continue
+                    end
+                end
+
+                -- If battery heading but battery lost - reset
+                if tick() - lastCarryBatteryCheck > (isCarryingBattery and 1.5 or 0.35) then
+                    lastCarryBatteryCheck = tick()
+                    lastCarryBatteryValue = hasBattery()
+                    isCarryingBattery = lastCarryBatteryValue
+                end
+                if hasBatteryAndHeadingToFuseBox and not isCarryingBattery then
+                    hasBatteryAndHeadingToFuseBox = false
+                    fuseBoxTargetPosition = nil
+                    print("Battery lost! Resetting FuseBox state.")
+                end
+                
+                -- Mini-game check
+                local pGui = player:FindFirstChild("PlayerGui")
+                local activeMiniEvent = nil
+                local currentMiniGameGen = nil
+                if pGui then
+                    for _, g in ipairs(pGui:GetChildren()) do
+                        if g:IsA("ScreenGui") and (g.Name:find("Minigame") or g.Name:find("Generator") or g:FindFirstChild("MainFrame") or g:FindFirstChild("Container")) then
+                            local main = g:FindFirstChild("MainFrame") or g:FindFirstChild("Container")
+                            if main and (main.Visible or (main:IsA("CanvasGroup") and main.GroupTransparency < 1)) then
+                                activeMiniEvent = g:FindFirstChild("Event", true) or main:FindFirstChild("Event", true)
+                                local hrpPos = hrp.Position
+                                local minDist = 20
+                                for _, gen in ipairs(found.generators) do
+                                    local genPart = gen:IsA("BasePart") and gen or gen:FindFirstChildWhichIsA("BasePart", true)
+                                    if genPart then
+                                        local d = (hrpPos - genPart.Position).Magnitude
+                                        if d < minDist then
+                                            minDist = d
+                                            currentMiniGameGen = gen
+                                        end
+                                    end
+                                end
+                                if activeMiniEvent then break end
+                            end
+                        end
+                    end
+                end
+
+                -- If carrying battery, don't repair generators
+                if hasBattery() and activeMiniEvent then
+                    print("Carrying battery! Closing generator UI.")
+                    pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
+                    activeMiniEvent = nil
+                end
+
+                if activeMiniEvent and currentMiniGameGen == currentRepairTargetGen then
+                    _G.BBN_Status = "Repairing Gen"
+                    lastMiniGameTime = tick()
+                    if tick() - lastRepairTime >= repairCooldown then
+                        print("Repairing... Cooldown: " .. repairCooldown)
+                        activeMiniEvent:FireServer({["Wires"]=true,["Switches"]=true,["Lever"]=true,["Type"]="Finish"}) 
+                        lastRepairTime = tick()
+                        repairCooldown = math.random(5, 7)
+                        
+                        task.wait(0.5)
+                        if isGeneratorFinished(currentRepairTargetGen) then
+                            print("Generator finished! Waiting 5 seconds before next...")
+                            _G.BBN_GensRepaired = (_G.BBN_GensRepaired or 0) + 1
+                            currentRepairTargetGen = nil
+                            _G.BBN_Status = "Gen Finished (Wait)"
+                            task.wait(5) -- Ждем 5 секунд после завершения
+                        end
+                    end
+                else
+                    -- === PRIORITY LOGIC: BATTERY -> GENERATORS -> SAFE ZONE ===
+                    -- 1. Используем тот же `found`, что в начале итерации (findObjects сам кэшируется; отдельный вызов здесь дублировал нагрузку)
+                    local unfinishedGens = {}
+                    for _, gen in ipairs(found.generators) do
+                        if not isGeneratorFinished(gen) and not brokenGenerators[gen] then
+                            table.insert(unfinishedGens, gen)
+                        end
+                    end
+                    
+                    local nowCarryTick = tick()
+                    if nowCarryTick - lastCarryBatteryCheck > (lastCarryBatteryValue and 1.5 or 0.35) then
+                        lastCarryBatteryCheck = nowCarryTick
+                        lastCarryBatteryValue = hasBattery()
+                    end
+                    local carryingBattery = lastCarryBatteryValue
+
+                    local battery = nil
+                    local nearestBatteryDist = math.huge
+                    local availableBatteries = 0
+                    if not carryingBattery then
+                        local batteryCandidates = {}
+                        for _, b in ipairs(found.batteries) do
+                            batteryCandidates[#batteryCandidates + 1] = b
+                        end
+
+                        -- Fallback: если кэш/структура карты временно не дала батареи, берём напрямую из IGNORE
+                        if #batteryCandidates == 0 then
+                            local fallbackBat = getBatteryFallbackList()
+                            for i = 1, #fallbackBat do
+                                batteryCandidates[#batteryCandidates + 1] = fallbackBat[i]
+                            end
+                        end
+
+                        for _, b in ipairs(batteryCandidates) do
+                            if not isHeldByOther(b) then
+                                availableBatteries = availableBatteries + 1
+                                local bPart = b:IsA("BasePart") and b or b:FindFirstChild("Position") or b:FindFirstChildWhichIsA("BasePart", true)
+                                if bPart then
+                                    local d = (hrp.Position - bPart.Position).Magnitude
+                                    if d < nearestBatteryDist then
+                                        nearestBatteryDist = d
+                                        battery = b
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    
+                    local fbFolder = Workspace:FindFirstChild("Maps") and Workspace.Maps:FindFirstChild("GAME MAP") and Workspace.Maps["GAME MAP"]:FindFirstChild("FuseBoxes")
+                    local bestFB = nil
+                    local minDist = math.huge
+                    local availableFB = 0
+                    
+                    local function scanFB(fb)
+                        if fb:IsA("Model") and not isFuseBoxUsed(fb) then
+                            availableFB = availableFB + 1
+                            local p = fb:FindFirstChild("Position") or fb:FindFirstChildWhichIsA("BasePart", true)
+                            if p then
+                                local d = (hrp.Position - p.Position).Magnitude
+                                if d < minDist then
+                                    minDist = d
+                                    bestFB = fb
+                                end
+                            end
+                        end
+                    end
+
+                    if fbFolder then
+                        for _, fb in ipairs(fbFolder:GetChildren()) do scanFB(fb) end
+                    end
+                    for _, fb in ipairs(found.fuseboxes) do scanFB(fb) end
+
+                    -- СТРОГИЙ ПРИОРИТЕТ БАТАРЕИ: если есть батарея в руках ИЛИ есть свободная батарея на карте
+                    if isCarryingBattery or battery then
+                        _G.BBN_Status = string.format("Bat: %d | Gens: %d", availableBatteries, #unfinishedGens)
+                        batterySearchStart = 0 
+                        if inSafeZoneWaiting then
+                            pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
+                        end
+                        inSafeZoneWaiting = false
+                        cameraMovedInSafeZone = false
+                        fPressedInSafeZone = false
+                        
+                        if isCarryingBattery then
+                            _G.BBN_Status = "Carrying Battery"
+                            -- Используем уже найденный bestFB вместо повторного сканирования всего Workspace
+                            if not bestFB then
+                                minDist = math.huge
+                                if fbFolder then
+                                    for _, fb in ipairs(fbFolder:GetChildren()) do scanFB(fb) end
+                                end
+                                for _, fb in ipairs(found.fuseboxes) do scanFB(fb) end
+                            end
+
+                            if bestFB then
+                                local fbPart = bestFB:FindFirstChild("HumanoidRootPart") or bestFB:FindFirstChild("Position") or bestFB:FindFirstChildWhichIsA("BasePart", true)
+                                if fbPart then
+                                    local distToFB = (hrp.Position - fbPart.Position).Magnitude
+                                    
+                                    if distToFB > 8 and canTeleport(false) then
+                                        -- СТРОГАЯ ПРОВЕРКА: Если мы прячемся ИЛИ маньяк рядом - НИКАКИХ телепортов!
+                                        if isHidingUnderground or isFlying or killerDist < 60 then
+                                            print("Cannot TP to FB: Killer too close or Hiding.")
+                                            task.wait(0.5)
+                                            continue 
+                                        end
+
+                                        print("Teleporting to nearest FuseBox Position: " .. bestFB.Name)
+                                        local fbTpCF = getFuseboxTeleportCFrame(bestFB, fbPart)
+                                        if fbTpCF then
+                                            hrp.CFrame = fbTpCF
+                                        end
+                                        markTeleport()
+                                        task.wait(0.1)
+                                        distToFB = (hrp.Position - fbPart.Position).Magnitude
+                                    end
+
+                                    -- Если вставка не стартует, подходим ближе как на генераторах (мягкий дожим без спама)
+                                    if distToFB > 4 and distToFB < 22 and tick() - lastFuseboxNudge > 1.25 then
+                                        lastFuseboxNudge = tick()
+                                        local posPart = bestFB:FindFirstChild("Position")
+                                        if posPart and posPart:IsA("BasePart") then
+                                            hrp.CFrame = posPart.CFrame
+                                        else
+                                            hrp.CFrame = CFrame.new(fbPart.Position + Vector3.new(0, 2.2, 0))
+                                        end
+                                        task.wait(0.08)
+                                        distToFB = (hrp.Position - fbPart.Position).Magnitude
+                                    end
+
+                                    if distToFB < 8 then
+                                        _G.BBN_Status = "Installing..."
+                                        smoothAim(fbPart.Position, 0.3)
+                                        local prompt = bestFB:FindFirstChildWhichIsA("ProximityPrompt", true)
+                                        
+                                        if getKillerDist() < 55 then continue end
+
+                                        if prompt then fireproximityprompt(prompt) end
+                                        task.wait(0.1)
+                                        
+                                        if distToFB < 5 and isCarryingBattery then
+                                            _G.BBN_Status = "Charging..."
+                                            local oldCamType = Workspace.CurrentCamera.CameraType
+                                            local aimConn = RunService.RenderStepped:Connect(function()
+                                                -- Не вызываем hasBattery() каждый кадр: это вызывало лаги из-за частого сканирования Descendants
+                                                if autoGenEnabled and states["AUTO FARM"] then
+                                                    Workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
+                                                    Workspace.CurrentCamera.CFrame = CFrame.new(Workspace.CurrentCamera.CFrame.Position, fbPart.Position)
+                                                end
+                                            end)
+
+                                            pcall(function() VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game) end)
+                                            local holdStart = tick()
+                                            while tick() - holdStart < 8 and lastCarryBatteryValue do
+                                                if tick() - lastCarryBatteryCheck > 1.3 then
+                                                    lastCarryBatteryCheck = tick()
+                                                    lastCarryBatteryValue = hasBattery()
+                                                end
+                                                if getKillerDist() < 55 or not autoGenEnabled then
+                                                    pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
+                                                    break
+                                                end
+                                                task.wait(0.1)
+                                            end
+                                            pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
+                                            aimConn:Disconnect()
+                                            Workspace.CurrentCamera.CameraType = oldCamType
+                                            
+                                            if not lastCarryBatteryValue then
+                                                markFuseBoxUsed(bestFB)
+                                                print("Battery installed successfully in " .. bestFB.Name)
+                                                bestFB = nil -- Сбрасываем цель после установки
+                                                task.wait(0.5)
+                                                -- СРАЗУ ПЕРЕХОДИМ К СЛЕДУЮЩЕЙ БАТАРЕЕ
+                                                continue
+                                            else
+                                                -- Батарея всё ещё в руках: слегка сближаемся и пробуем снова на следующем тике
+                                                if tick() - lastFuseboxNudge > 0.9 then
+                                                    lastFuseboxNudge = tick()
+                                                    local posPart = bestFB:FindFirstChild("Position")
+                                                    if posPart and posPart:IsA("BasePart") then
+                                                        hrp.CFrame = posPart.CFrame
+                                                    else
+                                                        hrp.CFrame = CFrame.new(fbPart.Position + Vector3.new(0, 2.0, 0))
+                                                    end
+                                                    task.wait(0.06)
+                                                end
+                                            end
+                                        end
+                                        continue
+                                    end
+                                end
+                            else
+                                _G.BBN_Status = "No Free FuseBox"
+                                task.wait(1)
+                                continue
+                            end
+                        else
+                            -- Pick up battery
+                            _G.BBN_Status = "Heading to Battery"
+                            local bPart = battery:IsA("BasePart") and battery or battery:FindFirstChild("Position") or battery:FindFirstChildWhichIsA("BasePart", true)
+                            if bPart then
+                                local distToB = (hrp.Position - bPart.Position).Magnitude
+
+                                -- Телепорт к батарее
+                                if distToB > 10 and canTeleport(false) then
+                                    print("Teleporting to battery...")
+                                    hrp.CFrame = bPart.CFrame * CFrame.new(0, 2, 0)
+                                    markTeleport()
+                                    task.wait(0.2)
+                                    distToB = (hrp.Position - bPart.Position).Magnitude
+                                end
+
+                                if distToB < 7 then
+                                    _G.BBN_Status = "Picking up Battery"
+                                    local oldCamType = Workspace.CurrentCamera.CameraType
+                                    local aimConn = RunService.RenderStepped:Connect(function()
+                                        -- Избегаем тяжелых hasBattery() в RenderStepped для снижения лагов
+                                        if autoGenEnabled and states["AUTO FARM"] then
+                                            Workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
+                                            Workspace.CurrentCamera.CFrame = CFrame.new(Workspace.CurrentCamera.CFrame.Position, bPart.Position)
+                                        end
+                                    end)
+
+                                    print("Holding F to pick up battery...")
+                                    pcall(function() 
+                                        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+                                        local prompt = battery:FindFirstChildWhichIsA("ProximityPrompt", true)
+                                        if prompt and fireproximityprompt then fireproximityprompt(prompt) end
+                                    end)
+                                    
+                                    local holdStart = tick()
+                                    local nextPickBatteryCheck = 0
+                                    local nextPromptRetry = 0
+                                    while tick() - holdStart < 8 do
+                                        if tick() >= nextPickBatteryCheck then
+                                            nextPickBatteryCheck = tick() + 0.3
+                                            if hasBattery() then
+                                                print("Battery detected in hand! Exiting pickup loop.")
+
+                                                -- Ждем пока пройдут лаги после взятия батареи
+                                                _G.BBN_Status = "We are waiting for the lags to pass😴"
+                                                task.wait(2)
+
+                                                break
+                                            end
+                                        end
+                                        if getKillerDist() < 55 or not autoGenEnabled then break end
+                                        
+                                        _G.BBN_Status = "Picking up (" .. string.format("%.1f", 8 - (tick()-holdStart)) .. "s)"
+                                        
+                                        local prompt = battery:FindFirstChildWhichIsA("ProximityPrompt", true)
+                                        if prompt and fireproximityprompt and tick() >= nextPromptRetry then
+                                            nextPromptRetry = tick() + 0.32
+                                            fireproximityprompt(prompt)
+                                        end
+                                        task.wait(0.11)
+                                    end
+                                    
+                                    pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
+                                    aimConn:Disconnect()
+                                    Workspace.CurrentCamera.CameraType = oldCamType
+                                end
+                            end
+                        end
+                        continue 
+                    end
+                    
+                    -- 2. BATTERY NOT AVAILABLE -> SEARCH FOR GENERATORS
+                        local targetGen = nil
+                        -- unfinishedGens уже заполнен выше
+                        
+                        if #unfinishedGens > 0 then
+                            targetGen = unfinishedGens[1]
+                        end
+
+                        if targetGen then
+                            if inSafeZoneWaiting then
+                                pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
+                            end
+                            inSafeZoneWaiting = false -- Сброс режима Safe Zone
+                            cameraMovedInSafeZone = false
+                            fPressedInSafeZone = false
+
+                            -- ПРОВЕРКА ПЕРЕД ВЫЛЕЗАНИЕМ: Если генератор уже починен - проверяем маньяка
+                            if isGeneratorFinished(targetGen) then
+                                print("⚠️ Target generator is already finished! Checking killer position...")
+
+                                local mainPart = targetGen:IsA("BasePart") and targetGen or targetGen:FindFirstChild("Main") or targetGen:FindFirstChildWhichIsA("BasePart", true)
+                                if mainPart then
+                                    local killerPos = found.killers[1] and (found.killers[1]:IsA("Model") and found.killers[1].PrimaryPart or found.killers[1]:FindFirstChildWhichIsA("BasePart", true))
+
+                                    if killerPos then
+                                        local distKillerToGen = (killerPos.Position - mainPart.Position).Magnitude
+
+                                        if distKillerToGen < 50 then
+                                            print("❌ Killer is camping finished generator (dist: " .. math.floor(distKillerToGen) .. "m)! Skipping to next gen.")
+                                            _G.BBN_Status = "Killer camping finished gen, skipping..."
+
+                                            -- Помечаем как пропущенный и идем к следующему
+                                            brokenGenerators[targetGen] = true
+                                            currentRepairTargetGen = nil
+                                            task.wait(1)
+                                            continue
+                                        end
+                                    end
+
+                                    -- Генератор починен и маньяка нет рядом - просто пропускаем
+                                    print("✅ Generator finished and killer not camping. Skipping to next gen.")
+                                    brokenGenerators[targetGen] = true
+                                    currentRepairTargetGen = nil
+                                    continue
+                                end
+                            end
+
+                            _G.BBN_Status = "Heading to Gen"
+                            
+                            -- Если сменили генератор - сбрасываем индексы
+                            if currentRepairTargetGen ~= targetGen then
+                                currentRepairTargetGen = targetGen
+                                currentRepairAttempts = 0
+                                currentPromptIndex = 1
+                                currentPointIndex = 1
+                                print("Targeted new generator.")
+                            end
+
+                            local mainPart = targetGen:IsA("BasePart") and targetGen or targetGen:FindFirstChild("Main") or targetGen:FindFirstChildWhichIsA("BasePart", true)
+                            if mainPart then
+                                local prompts = {}
+                                for _, v in ipairs(targetGen:GetDescendants()) do
+                                    if v:IsA("ProximityPrompt") then table.insert(prompts, v) end
+                                end
+                                
+                                -- Если промпты не найдены - пропускаем
+                                if #prompts == 0 then
+                                    print("No prompts on generator! Skipping.")
+                                    brokenGenerators[targetGen] = true
+                                    continue
+                                end
+
+                                -- Корректируем индекс промпта если он вышел за пределы
+                                if currentPromptIndex > #prompts then
+                                    print("All prompts tried! Skipping generator.")
+                                    brokenGenerators[targetGen] = true
+                                    currentRepairTargetGen = nil
+                                    continue
+                                end
+
+                                local currentPrompt = prompts[currentPromptIndex]
+                                local promptPart = currentPrompt.Parent:IsA("BasePart") and currentPrompt.Parent or mainPart
+                                
+                                -- Генерируем точки для ТЕКУЩЕГО промпта: центр + 4 стороны + углы
+                                local points = {
+                                    promptPart.CFrame * CFrame.new(0, 0, 3.5), -- Центр
+                                    promptPart.CFrame * CFrame.new(3.5, 0, 0), -- Право
+                                    promptPart.CFrame * CFrame.new(-3.5, 0, 0), -- Лево
+                                    promptPart.CFrame * CFrame.new(0, 0, -3.5), -- Сзади
+                                    promptPart.CFrame * CFrame.new(2.5, 0, 2.5), -- Угол 1
+                                    promptPart.CFrame * CFrame.new(-2.5, 0, 2.5), -- Угол 2
+                                    promptPart.CFrame * CFrame.new(2.5, 0, -2.5), -- Угол 3
+                                    promptPart.CFrame * CFrame.new(-2.5, 0, -2.5), -- Угол 4
+                                    promptPart.CFrame * CFrame.new(0, 1.5, 1.5) -- Сверху
+                                }
+
+                                local targetCFrame = points[currentPointIndex] or points[1]
+                                local distToTarget = (hrp.Position - targetCFrame.Position).Magnitude
+
+                                -- Если далеко от генератора - телепортируемся
+                                if distToTarget > 7 and (hrp.Position - promptPart.Position).Magnitude > 7 then
+                                    -- Проверка на маньяка
+                                    if killerDist < 60 then
+                                        print("Killer too close! Cannot teleport to generator.")
+                                        task.wait(0.5)
+                                        continue
+                                    end
+
+                                    if canTeleport(false) then
+                                        print("Teleporting to generator (initial approach)...")
+                                        hrp.CFrame = targetCFrame
+                                        markTeleport()
+                                        task.wait(0.2)
+
+                                        -- Наводим камеру на промпт
+                                        smoothAim(promptPart.Position, 0.3)
+                                    else
+                                        print("Teleport on cooldown, waiting...")
+                                        task.wait(0.5)
+                                        continue
+                                    end
+                                    continue
+                                end
+
+                                if (distToTarget < 7 or (hrp.Position - promptPart.Position).Magnitude < 7) then
+                                    _G.BBN_Status = "Repairing..."
+                                    
+                                    -- Дополнительная проверка перед началом починки
+                                    if killerDist < 60 then
+                                        print("Killer came close! Stopping repair.")
+                                        continue
+                                    end
+
+                                        -- Если мини-игра не открылась через 3 сек после ТП - пробуем следующую точку/промпт
+                                    if not activeMiniEvent and tick() - lastTeleportTime > 3 then
+                                        currentPointIndex = currentPointIndex + 1
+                                        
+                                        if currentPointIndex > #points then
+                                            currentPointIndex = 1
+                                            currentPromptIndex = currentPromptIndex + 1
+                                        end
+                                        
+                                        if currentPromptIndex <= #prompts then
+                                            local nextPrompt = prompts[currentPromptIndex]
+                                            local nextPart = nextPrompt.Parent:IsA("BasePart") and nextPrompt.Parent or mainPart
+                                            local nextPoint = points[currentPointIndex] or nextPart.CFrame * CFrame.new(0,0,3.5)
+
+                                            -- Телепорт к следующей точке генератора
+                                            if canTeleport(false) then
+                                                print("Teleporting to generator point...")
+                                                hrp.CFrame = nextPoint
+                                                markTeleport()
+                                                task.wait(0.2)
+
+                                                -- Наводим камеру на промпт
+                                                smoothAim(nextPart.Position, 0.3)
+                                            else
+                                                print("Teleport on cooldown, waiting...")
+                                                task.wait(0.5)
+                                            end
+                                        end
+                                        continue
+                                    end
+
+                                    -- Если мини-игра не открылась, пробуем нащупать кнопку
+                                    if not activeMiniEvent then
+                                        local oldCamType = Workspace.CurrentCamera.CameraType
+                                        local aimConn = RunService.RenderStepped:Connect(function()
+                                            if autoGenEnabled and not activeMiniEvent and currentRepairTargetGen == targetGen then
+                                                Workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
+                                                -- Динамическое наведение прямо на Промпт
+                                                local targetLookAt = currentPrompt.Parent:IsA("BasePart") and currentPrompt.Parent.Position or promptPart.Position
+                                                Workspace.CurrentCamera.CFrame = CFrame.new(Workspace.CurrentCamera.CFrame.Position, targetLookAt)
+                                            end
+                                        end)
+                                        
+                                        task.wait(0.1)
+                                        if fireproximityprompt then fireproximityprompt(currentPrompt) end
+                                        
+                                        pcall(function() 
+                                            print("Spamming F to start repair...")
+                                            while not activeMiniEvent and autoGenEnabled and states["AUTO FARM"] do
+                                                if getKillerDist() < 55 or isHidingUnderground or isFlying then 
+                                                    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+                                                    break 
+                                                end
+                                                
+                                                _G.BBN_Status = "Starting Repair..."
+                                                
+                                                -- Спамим промпт и клавишу F
+                                                if fireproximityprompt then fireproximityprompt(currentPrompt) end
+                                                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+                                                
+                                                task.wait(0.1)
+                                                
+                                                -- Если за 5 секунд на этой точке ничего не вышло - пробуем сменить точку (защита от застревания)
+                                                if tick() - lastTeleportTime > 5 then
+                                                    print("Timeout on this point, will try next.")
+                                                    break
+                                                end
+                                            end
+                                            
+                                            if not activeMiniEvent then
+                                                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+                                            end
+                                        end)
+                                        
+                                        aimConn:Disconnect()
+                                        Workspace.CurrentCamera.CameraType = oldCamType
+                                    else
+                                        -- Мини-игра уже открыта, сбрасываем попытки
+                                        currentPointIndex = 1
+                                        local oldCamType = Workspace.CurrentCamera.CameraType
+                                        Workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
+                                        Workspace.CurrentCamera.CFrame = CFrame.new(Workspace.CurrentCamera.CFrame.Position, promptPart.Position)
+                                        
+                                        if fireproximityprompt then fireproximityprompt(currentPrompt) end
+                                        pcall(function() VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game) end)
+                                        
+                                        task.wait(0.2)
+                                        Workspace.CurrentCamera.CameraType = oldCamType
+                                    end
+                                    task.wait(0.1)
+                                    continue
+                                else
+                                    if canTeleport(false) then
+                                        -- СТРОГАЯ ПРОВЕРКА: Если мы прячемся ИЛИ маньяк рядом - НИКАКИХ телепортов к генам!
+                                        if isHidingUnderground or isFlying or killerDist < 60 then
+                                            print("Cannot TP to Gen: Killer too close or Hiding.")
+                                            task.wait(0.5)
+                                            continue
+                                        end
+
+                                        local killerAtTarget = false
+                                        local killerObj = nil
+                                        local killerFolder = Workspace:FindFirstChild("PLAYERS") and Workspace.PLAYERS:FindFirstChild("KILLER")
+                                        if killerFolder then
+                                            killerObj = killerFolder:FindFirstChildWhichIsA("Model")
+                                        end
+                                        if killerObj and killerObj:FindFirstChild("HumanoidRootPart") then
+                                            if (targetCFrame.Position - killerObj.HumanoidRootPart.Position).Magnitude <= 60 then
+                                                killerAtTarget = true
+                                            end
+                                        end
+                                        
+                                        if killerAtTarget then
+                                            print("Killer at target generator! Skipping TP.")
+                                            _G.BBN_Status = "Killer at Gen"
+                                            task.wait(1)
+                                            continue
+                                        end
+
+                                        _G.BBN_Status = "TP to Gen"
+                                        hrp.CFrame = targetCFrame
+                                        markTeleport()
+                                        task.wait(0.3)
+                                        
+                                        if getKillerDist() <= 55 then
+                                            print("Killer detected at target! Hiding.")
+                                            goUnderground()
+                                            continue
+                                        end
+                                        
+                                        smoothAim(promptPart.Position, 0.6)
+                                        lastMiniGameTime = tick()
+                                    end
+                                end
+                            end
+                        else
+                            -- 3. BATTERIES & GENS DONE -> SAFE ZONE
+                            if batterySearchStart == 0 then batterySearchStart = tick() end
+                            
+                            if tick() - batterySearchStart < 5 then
+                                _G.BBN_Status = "Searching Targets (" .. math.floor(5 - (tick()-batterySearchStart)) .. "s)"
+                                task.wait(0.5)
+                                continue
+                            end
+
+                            _G.BBN_Status = "Waiting in Safe"
+                            local distToSafe = (hrp.Position - safeZoneFinalPos).Magnitude
+                            
+                            local safeCdReady = (tick() - lastSafeZoneTeleportAt) >= TELEPORT_COOLDOWN
+                            if distToSafe > 10 and canTeleport(false) and safeCdReady then
+                                print("No targets available. Teleporting to Safe Zone.")
+                                pressKey(Enum.KeyCode.Space)
+                                task.wait(0.05)
+                                stopFly()
+                                isHidingUnderground = false
+                                hrp.CFrame = CFrame.new(safeZoneFinalPos)
+                                markTeleport()
+                                lastSafeZoneTeleportAt = tick()
+                                
+                                inSafeZoneWaiting = true
+                                safeZoneRoutineStart = tick()
+                                cameraMovedInSafeZone = false
+                            end
+                            
+                            if distToSafe <= 10 then
+                                if not inSafeZoneWaiting then
+                                    inSafeZoneWaiting = true
+                                    safeZoneRoutineStart = tick()
+                                    cameraMovedInSafeZone = false
+                                    fPressedInSafeZone = false
+                                end
+                                
+                                if not cameraMovedInSafeZone then
+                                    cameraMovedInSafeZone = true
+                                    smoothAim(hrp.Position + Vector3.new(0, -10, 0), 0.5)
+                                end
+
+                                if cameraMovedInSafeZone and not fPressedInSafeZone and tick() - safeZoneRoutineStart >= 2 then
+                                    fPressedInSafeZone = true
+                                    pcall(function() VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game) end)
+                                end
+                            end
+                            
+                            local totalMins = getGameTime()
+                            if totalMins >= 360 and totalMins < 1000 then
+                                pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
+                                isEscaping = true
+                            end
+                            task.wait(1)
+                        end
+                    end
+            -- AUTO GEN (without AUTO FARM) - ONLY completes mini-game, NO teleport/aim
+            elseif states["AUTO GEN"] and isSurvivor and hrp and hum and currentMap ~= "Waiting..." and not states["AUTO FARM"] then
+                -- Killer protection + при прятках: телепорт в сейф / ротация выходов Pizzeria (см. cleanupHidingAndTeleportTo)
+                local killerDist = getKillerDist()
+                local foundNow = findObjects()
+                if isMinionOnMe(foundNow.minions, char, hrp) then
+                    _G.BBN_Status = "Minion on me! Shake"
+                    if not isHidingUnderground and not isFlying then
+                        goUnderground()
+                    end
+                    local function minionStillOnMe()
+                        local c = player.Character
+                        local r = c and c:FindFirstChild("HumanoidRootPart")
+                        if not c or not r then return false end
+                        local f = cachedObjects.data
+                        if tick() - cachedObjects.lastUpdate > 0.6 then
+                            f = findObjects()
+                        end
+                        return isMinionOnMe(f.minions, c, r)
+                    end
+                    shakeCameraRapid(5, minionStillOnMe)
+                    task.wait(0.05)
+                    continue
+                end
+
+                -- Instant reaction if killer is within 55m
+                if killerDist < 55 and not justReturnedFromUnderground then
+                    if not isHidingUnderground and not isFlying then
+                        _G.BBN_Status = "Hiding"
+                        goUnderground()
+                    end
+                end
+
+                -- Return to surface when killer is far (>=100m for Forest, >=60m for others)
+                local currentMap = detectMap()
+                local returnDist = (currentMap == "Forest") and 100 or 60
+                if killerDist >= returnDist and killerDist ~= 1000 then
+                    if isHidingUnderground or isFlying then
+                        print("Killer far enough (" .. math.floor(killerDist) .. "m). Ascending.")
+                        _G.BBN_Status = "Exiting"
+                        forceReturnFromHide(currentMap)
+                    end
+                end
+
+                if isHidingUnderground or isFlying then
+                    local mapGn = detectMap()
+                    local targetReached = false
+                    if mapGn == "Forest" then
+                        if hrp.Position.Y >= 35 then targetReached = true end
+                    else
+                        if hrp.Position.Y <= (originalPosBeforeHide and originalPosBeforeHide.Y - 4 or -20) or hrp.Position.Y <= MIN_DEPTH_Y + 5 then targetReached = true end
+                    end
+
+                    if not targetReached then
+                        _G.BBN_Status = "Moving to Hideout"
+                    else
+                        _G.BBN_Status = "Hidden"
+                    end
+                    task.wait(0.1)
+                    continue
+                end
+
+                -- Mini-game check
+                local pGui = player:FindFirstChild("PlayerGui")
+                local activeMiniEvent = nil
+                if pGui then
+                    for _, g in ipairs(pGui:GetChildren()) do
+                        if g:IsA("ScreenGui") and (g.Name:find("Minigame") or g.Name:find("Generator") or g:FindFirstChild("MainFrame") or g:FindFirstChild("Container")) then
+                            local main = g:FindFirstChild("MainFrame") or g:FindFirstChild("Container")
+                            if main and (main.Visible or (main:IsA("CanvasGroup") and main.GroupTransparency < 1)) then
+                                activeMiniEvent = g:FindFirstChild("Event", true) or main:FindFirstChild("Event", true)
+                                if activeMiniEvent then break end
+                            end
+                        end
+                    end
+                end
+
+                if activeMiniEvent then
+                    _G.BBN_Status = "Completing Gen"
+                    if tick() - lastRepairTime >= repairCooldown then
+                        print("AUTO GEN: Finishing mini-game...")
+                        activeMiniEvent:FireServer({["Wires"]=true,["Switches"]=true,["Lever"]=true,["Type"]="Finish"}) 
+                        lastRepairTime = tick()
+                        repairCooldown = math.random(5, 7)
+                        
+                        -- Проверка не закончился ли генератор после нашего действия
+                        task.spawn(function()
+                            task.wait(1)
+                            local found = findObjects()
+                            local hrpPos = hrp.Position
+                            for _, gen in ipairs(found.generators) do
+                                local genPart = gen:IsA("BasePart") and gen or gen:FindFirstChildWhichIsA("BasePart", true)
+                                if genPart and (hrpPos - genPart.Position).Magnitude < 15 then
+                                    if isGeneratorFinished(gen) then
+                                        _G.BBN_GensRepaired = (_G.BBN_GensRepaired or 0) + 1
+                                        print("AUTO GEN: Generator finished by me!")
+                                        break
+                                    end
+                                end
+                            end
+                        end)
+                    end
+                else
+                    _G.BBN_Status = "Idle"
+                end
+            end
+            task.wait(0.1) -- Faster loop for instant reaction (55m check)
+        end 
+    end)
+end
+
+local function toggleAutoCursor(enable)
+    autoCursorEnabled = enable
+    if not enable then return end
+
+    local pGui = player:FindFirstChild("PlayerGui")
+    task.spawn(function()
+        while autoCursorEnabled and _G.BBN_Running do
+            if pGui then
+                for _, g in ipairs(pGui:GetChildren()) do
+                    if g.Name == "Minigame" or (g:IsA("ScreenGui") and g:FindFirstChild("Container")) then
+                        local container = g:FindFirstChild("Container")
+                        if container then
+                            local box = container:FindFirstChild("Box")
+                            local frame = container:FindFirstChild("Frame")
+                            if box and frame then
+                                local targetPos = box.AbsolutePosition + (box.AbsoluteSize / 2)
+                                frame.Position = UDim2.new(0, targetPos.X, 0, targetPos.Y)
+                                task.wait(0.2)
+                            end
+                        end
+                    end
+                end
+            end
+            task.wait(0.1)
+        end
+    end)
+end
+
+local function toggleInfinityStamina(enable)
+    infinityStaminaEnabled = enable
+    if not enable then return end
+    task.spawn(function()
+        while infinityStaminaEnabled and _G.BBN_Running do
+            local char = player.Character
+            if char then
+                -- В Bite By Night стамина часто хранится в атрибутах
+                pcall(function() 
+                    char:SetAttribute("Stamina", 100)
+                    char:SetAttribute("stamina", 100)
+                end)
+                -- Или в виде NumberValue
+                local staminaVal = char:FindFirstChild("Stamina") or char:FindFirstChild("stamina")
+                if staminaVal and (staminaVal:IsA("NumberValue") or staminaVal:IsA("IntValue")) then
+                    staminaVal.Value = 100
+                end
+            end
+            RunService.Heartbeat:Wait() -- Обновление каждую миллисекунду (каждый кадр)
+        end
+    end)
+end
+
+local function toggleSpiritMode(enable)
+    if spiritConn then spiritConn:Disconnect() spiritConn = nil end
+    spiritEnabled = enable
+    if enable then
+        task.spawn(function() 
+            spiritSphere = Instance.new("Part", Workspace)
+            spiritSphere.Shape = Enum.PartType.Ball
+            spiritSphere.Size = Vector3.new(0.5,0.5,0.5)
+            spiritSphere.Color = Color3.fromRGB(0, 150, 255)
+            spiritSphere.Material = Enum.Material.Neon
+            spiritSphere.Anchored, spiritSphere.CanCollide, spiritSphere.Transparency = true, false, 0.5
+            spiritSphere.CFrame = player.Character.HumanoidRootPart.CFrame
+            spiritSphere.Name = "BBN_Spirit"
+
+            local fire = Instance.new("Fire", spiritSphere)
+            fire.Color, fire.SecondaryColor, fire.Heat, fire.Size = Color3.fromRGB(0, 100, 255), Color3.fromRGB(0, 255, 255), 5, 2
+            
+            player.Character.HumanoidRootPart.Anchored = true
+            Workspace.CurrentCamera.CameraSubject = spiritSphere
+            spiritConn = RunService.RenderStepped:Connect(function(dt)
+                if not spiritEnabled or not spiritSphere then return end
+                local moveDir = Vector3.new(0,0,0)
+                local camCF = Workspace.CurrentCamera.CFrame
+                if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDir = moveDir + camCF.LookVector end
+                if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDir = moveDir - camCF.LookVector end
+                if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDir = moveDir - camCF.RightVector end
+                if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDir = moveDir + camCF.RightVector end
+                if UserInputService:IsKeyDown(Enum.KeyCode.Space) then moveDir = moveDir + Vector3.new(0, 1, 0) end
+                if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then moveDir = moveDir - Vector3.new(0, 1, 0) end
+                local speed = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) and 80 or 35
+                spiritSphere.CFrame = spiritSphere.CFrame + (moveDir * speed * dt)
+                fire.Size = moveDir.Magnitude > 0 and 3 or 2
+            end)
+            while spiritEnabled and _G.BBN_Running do task.wait(0.1) end
+            if spiritConn then spiritConn:Disconnect() end
+            if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+                player.Character.HumanoidRootPart.Anchored = false
+                player.Character.HumanoidRootPart.CFrame = spiritSphere.CFrame
+                Workspace.CurrentCamera.CameraSubject = player.Character.Humanoid
+            end
+            if spiritSphere then spiritSphere:Destroy() end
+        end)
+    end
+end
+
+-- ========== GUI ==========
+local gui = Instance.new("ScreenGui", CoreGui)
+gui.Name = "BiteByNightMenu"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+
+-- ========== ШОКОЛАДКА ==========
+local chocoBtn = Instance.new("TextButton", gui)
+chocoBtn.Size = UDim2.new(0, 30, 0, 30)
+chocoBtn.Position = UDim2.new(0, 10, 0, 10)
+chocoBtn.BackgroundColor3 = Color3.fromRGB(0,0,0)
+chocoBtn.BackgroundTransparency = 0.5
+chocoBtn.Text = "🍫"
+chocoBtn.TextSize = 20
+Instance.new("UICorner", chocoBtn).CornerRadius = UDim.new(0, 8)
+Instance.new("UIStroke", chocoBtn).Color = Color3.new(1,1,1)
+
+chocoBtn.MouseButton1Click:Connect(function()
+    local char = player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+    
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {char, Workspace:FindFirstChild("BBN_ChocolateTile")}
+    
+    local rayResult = Workspace:Raycast(char.HumanoidRootPart.Position, Vector3.new(0, -20, 0), rayParams)
+    local spawnPos = rayResult and rayResult.Position or char.HumanoidRootPart.Position - Vector3.new(0, 3, 0)
+    
+    local tile = Instance.new("Part")
+    tile.Name = "BBN_ChocolateTile"
+    tile.Size = Vector3.new(4, 0.5, 4)
+    tile.Position = spawnPos + Vector3.new(0, 0.25, 0) -- Чуть выше поверхности
+    tile.Anchored = true
+    tile.Material = Enum.Material.Slate
+    tile.Color = Color3.fromRGB(80, 50, 40) -- Цвет шоколада
+    tile.Parent = Workspace
+    
+    -- Удаляем старую плитку если была
+    for _, v in ipairs(Workspace:GetChildren()) do
+        if v.Name == "BBN_ChocolateTile" and v ~= tile then v:Destroy() end
+    end
+end)
+
+local function addTheButtonDecor(parent, starCount, emojiChar)
+    parent.ClipsDescendants = true
+    for i = 1, starCount or 50 do
+        local star = Instance.new("Frame", parent)
+        star.Size = UDim2.new(0, math.random(1, 2), 0, math.random(1, 2))
+        star.Position = UDim2.new(math.random(), 0, math.random(), 0)
+        star.BackgroundColor3 = Color3.new(1, 1, 1)
+        star.BackgroundTransparency = math.random(1, 4) / 10
+        star.BorderSizePixel = 0
+        star.ZIndex = parent.ZIndex + 1 -- На один выше родителя
+        Instance.new("UICorner", star).CornerRadius = UDim.new(1, 0)
+        task.spawn(function()
+            while star and star.Parent do
+                local t = math.random(1, 3)
+                TweenService:Create(star, TweenInfo.new(t, Enum.EasingStyle.Sine), {BackgroundTransparency = math.random(7, 10)/10}):Play()
+                task.wait(t)
+                TweenService:Create(star, TweenInfo.new(t, Enum.EasingStyle.Sine), {BackgroundTransparency = math.random(1, 4)/10}):Play()
+                task.wait(t)
+            end
+        end)
+    end
+    if emojiChar then
+        local emoji = Instance.new("TextLabel", parent)
+        emoji.Size = UDim2.new(0, 20, 0, 20)
+        emoji.Position = UDim2.new(1, -25, 0, 5)
+        emoji.BackgroundTransparency, emoji.Text, emoji.TextSize = 1, emojiChar, 14
+        emoji.ZIndex = parent.ZIndex + 1 -- На один выше родителя
+        emoji.Parent = parent
+        task.spawn(function()
+            while emoji and emoji.Parent do
+                TweenService:Create(emoji, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Rotation = 15}):Play()
+                task.wait(1)
+                TweenService:Create(emoji, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Rotation = -15}):Play()
+                task.wait(1)
+            end
+        end)
+    end
+end
+
+local welcomeFrame = Instance.new("Frame", gui)
+welcomeFrame.Size = UDim2.new(0, 240, 0, 90)
+welcomeFrame.Position = UDim2.new(0, -260, 0, 80)
+welcomeFrame.BackgroundColor3 = Color3.new(0, 0, 0)
+Instance.new("UICorner", welcomeFrame).CornerRadius = UDim.new(0, 12)
+Instance.new("UIStroke", welcomeFrame).Color = Color3.new(1, 1, 1)
+addTheButtonDecor(welcomeFrame, 50, "😉")
+
+local wTitle = Instance.new("TextLabel", welcomeFrame)
+wTitle.Size, wTitle.Position, wTitle.BackgroundTransparency = UDim2.new(1,0,0,30), UDim2.new(0,0,0,5), 1
+wTitle.Text, wTitle.TextColor3, wTitle.Font, wTitle.TextSize = "✨ Welcome!", Color3.new(1,1,1), Enum.Font.GothamBold, 16
+
+local wInfo = Instance.new("TextLabel", welcomeFrame)
+wInfo.Size, wInfo.Position, wInfo.BackgroundTransparency = UDim2.new(1,0,0,20), UDim2.new(0,0,0,30), 1
+wInfo.Text, wInfo.TextColor3, wInfo.Font, wInfo.TextSize = "Binds: [V] Fly | [Z] Fix Gen | [INS] Menu", Color3.new(0.8,0.8,0.8), Enum.Font.GothamBold, 11
+
+local statusLabel = Instance.new("TextLabel", welcomeFrame)
+statusLabel.Size, statusLabel.Position, statusLabel.BackgroundTransparency = UDim2.new(1,0,0,20), UDim2.new(0,0,0,50), 1
+statusLabel.Text, statusLabel.TextColor3, statusLabel.Font, statusLabel.TextSize = "Loading...", Color3.new(1,1,1), Enum.Font.GothamBold, 14
+
+local mainFrame = Instance.new("Frame", gui)
+mainFrame.Size, mainFrame.Position = UDim2.new(0, 420, 0, 140), UDim2.new(0.5, -210, 1, 20)
+mainFrame.BackgroundColor3, mainFrame.Active, mainFrame.Draggable = Color3.new(0, 0, 0), true, false
+mainFrame.ZIndex = 5 -- Фон на уровне 5
+mainFrame.ClipsDescendants = false -- Чтобы боковое меню было видно когда выезжает
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
+Instance.new("UIStroke", mainFrame).Color = Color3.new(1, 1, 1)
+addTheButtonDecor(mainFrame, 60, nil)
+
+local function animateMenu(show)
+    mainFrame:TweenPosition(show and UDim2.new(0.5, -210, 1, -160) or UDim2.new(0.5, -210, 1, 20), show and "Out" or "In", "Back", 0.6, true)
+end
+
+task.spawn(function()
+    welcomeFrame:TweenPosition(UDim2.new(0, 25, 0, 80), "Out", "Back", 1)
+    
+    local totalTime = math.random(4, 7)
+    local startTick = tick()
+    local loadingFrames = {"", ".", "..", "...", "..", "."}
+    local frameIdx = 1
+    while tick() - startTick < totalTime do
+        statusLabel.Text = "Loading" .. loadingFrames[frameIdx]
+        frameIdx = frameIdx + 1
+        if frameIdx > #loadingFrames then frameIdx = 1 end
+        task.wait(0.22)
+    end
+    
+    insBlocked = false
+    statusLabel.Text, statusLabel.TextColor3 = "Successfully", Color3.fromRGB(0, 255, 100)
+    pcall(function()
+        local doneSound = Instance.new("Sound")
+        doneSound.SoundId = "rbxassetid://71529119754263"
+        doneSound.Volume = 0.18
+        doneSound.Parent = welcomeFrame
+        doneSound:Play()
+        game:GetService("Debris"):AddItem(doneSound, 3)
+    end)
+    task.wait(1) -- Закрытие через 1 сек после завершения
+    animateMenu(true)
+    menuVisible = true
+    task.wait(1)
+    welcomeFrame:TweenPosition(UDim2.new(0, -260, 0, 80), "In", "Quart", 1)
+end)
+
+local tabFrame = Instance.new("Frame", mainFrame)
+tabFrame.Size, tabFrame.BackgroundTransparency = UDim2.new(1, 0, 0, 30), 1
+tabFrame.ZIndex = 7
+
+local mainTabBtn = Instance.new("TextButton", tabFrame)
+mainTabBtn.Size, mainTabBtn.BackgroundTransparency, mainTabBtn.Text = UDim2.new(0.35,0,1,0), 1, "Settings"
+mainTabBtn.TextColor3, mainTabBtn.Font, mainTabBtn.TextSize = Color3.new(1,1,1), Enum.Font.GothamBold, 14
+mainTabBtn.ZIndex = 8
+
+local mapLabel = Instance.new("TextLabel", tabFrame)
+mapLabel.Size, mapLabel.Position, mapLabel.BackgroundTransparency = UDim2.new(0.3,0,1,0), UDim2.new(0.35,0,0,0), 1
+mapLabel.Text, mapLabel.TextColor3, mapLabel.Font, mapLabel.TextSize = "Map: Unknown", Color3.fromRGB(150,200,255), Enum.Font.GothamBold, 11
+mapLabel.ZIndex = 8
+
+local tpTabBtn = Instance.new("TextButton", tabFrame)
+tpTabBtn.Size, tpTabBtn.Position, tpTabBtn.BackgroundTransparency, tpTabBtn.Text = UDim2.new(0.35,0,1,0), UDim2.new(0.65,0,0,0), 1, "⚡ Auto Farm"
+tpTabBtn.TextColor3, tpTabBtn.Font, tpTabBtn.TextSize = Color3.fromRGB(180,180,180), Enum.Font.GothamBold, 14
+tpTabBtn.ZIndex = 8
+
+local container = Instance.new("ScrollingFrame", mainFrame)
+container.Size, container.Position, container.BackgroundTransparency = UDim2.new(1,-20,1,-40), UDim2.new(0,10,0,35), 1
+container.BorderSizePixel, container.ScrollBarThickness, container.ScrollingEnabled = 0, 0, false
+container.ZIndex = 7
+
+local layout = Instance.new("UIGridLayout", container)
+layout.CellSize, layout.CellPadding = UDim2.new(0.48, 0, 0, 25), UDim2.new(0.02, 0, 0, 5)
+
+local function createSimpleButton(name, cb, color)
+    local b = Instance.new("TextButton", container)
+    b.BackgroundColor3, b.BackgroundTransparency = Color3.new(0,0,0), 0.7
+    addTheButtonDecor(b, 10)
+    b.Text, b.TextColor3, b.Font, b.TextSize = name, color or Color3.fromRGB(255, 150, 150), Enum.Font.GothamBold, 10
+    b.ZIndex = 8
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    local stroke = Instance.new("UIStroke", b)
+    stroke.Color = color or Color3.fromRGB(80,40,40)
+    b.MouseButton1Click:Connect(cb)
+    return b
+end
+
+local function createToggleButton(name, cb)
+    local b = Instance.new("TextButton", container)
+    b.BackgroundColor3, b.BackgroundTransparency = Color3.new(0,0,0), 0.7
+    addTheButtonDecor(b, 10)
+    local state = states[name] or false
+    b.Text, b.TextColor3, b.Font, b.TextSize = name..(state and ": ON" or ": OFF"), (state and Color3.new(1,1,1) or Color3.fromRGB(180,180,180)), Enum.Font.GothamBold, 10
+    b.ZIndex = 8
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    Instance.new("UIStroke", b).Color = Color3.fromRGB(60,60,65)
+    b.MouseButton1Click:Connect(function()
+        state = not state
+        states[name] = state
+        b.Text, b.TextColor3 = name..(state and ": ON" or ": OFF"), (state and Color3.new(1,1,1) or Color3.fromRGB(180,180,180))
+        cb(state)
+    end)
+    return b
+end
+
+local function createSmallButton(name, cb, color, pos)
+    local b = Instance.new("TextButton", container)
+    b.Size = UDim2.new(0, 45, 0, 20)
+    b.Position = pos
+    b.BackgroundColor3 = Color3.new(0,0,0)
+    b.BackgroundTransparency = 0.5
+    b.Text = name
+    b.TextColor3 = color
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 9
+    b.ZIndex = 9
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+    local stroke = Instance.new("UIStroke", b)
+    stroke.Color = color
+    stroke.Thickness = 1
+    b.MouseButton1Click:Connect(cb)
+    return b
+end
+
+local function buildMenu(tabName)
+    for _, child in ipairs(container:GetChildren()) do if not child:IsA("UIGridLayout") then child:Destroy() end end
+    if tabName == "Settings" then
+        layout.Parent = container -- Включаем сетку
+        mainTabBtn.TextColor3, tpTabBtn.TextColor3 = Color3.new(1,1,1), Color3.fromRGB(180,180,180)
+        createToggleButton("ESP ALL", toggleAllEsp)
+        createToggleButton("AUTO CURSOR", toggleAutoCursor)
+        createToggleButton("INFINITY STAMINA", toggleInfinityStamina)
+        createSimpleButton("SHUTDOWN SCRIPT", nuclearCleanup)
+    elseif tabName == "Auto Farm" then
+        layout.Parent = nil -- Выключаем сетку для ручного позиционирования
+        mainTabBtn.TextColor3, tpTabBtn.TextColor3 = Color3.fromRGB(180,180,180), Color3.new(1,1,1)
+        
+        local logsFrame = Instance.new("Frame", container)
+        logsFrame.Size = UDim2.new(1, 0, 0, 120)
+        logsFrame.Position = UDim2.new(0, 0, 0, 0) -- В упор под Map
+        logsFrame.BackgroundTransparency = 1
+        logsFrame.ZIndex = 8
+
+        -- Кнопки в правом верхнем углу (маленькие)
+        local startBtn = createSmallButton("START", function() 
+            states["AUTO FARM"] = true
+            states["AUTO GEN"] = true
+            toggleAutoGen(true)
+        end, Color3.fromRGB(0, 255, 100), UDim2.new(1, -50, 0, 5))
+        
+        local stopBtn = createSmallButton("STOP", function() 
+            states["AUTO FARM"] = false
+            states["AUTO GEN"] = false
+            toggleAutoGen(false)
+            
+            -- Сброс состояния при остановке (БЕЗ ОТКЛЮЧЕНИЯ _G.BBN_Running)
+            _G.BBN_Status = "Off"
+            isFlying = false
+            isHidingUnderground = false
+            
+            -- Отпускаем все клавиши
+            pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
+            pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game) end)
+            
+            local char = player.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.Anchored = false
+                hrp.Velocity = Vector3.new(0, 0, 0)
+                hrp.RotVelocity = Vector3.new(0, 0, 0)
+            end
+            stopFly()
+            restoreObjectsTransparency()
+            toggleNoclip(false)
+            if char then
+                for _, part in pairs(char:GetDescendants()) do
+                    if part:IsA("BasePart") then part.CanCollide = true end
+                end
+            end
+        end, Color3.fromRGB(255, 50, 50), UDim2.new(1, -100, 0, 5))
+        
+        local logsTitle = Instance.new("TextLabel", logsFrame)
+        logsTitle.Size = UDim2.new(1, 0, 0, 20)
+        logsTitle.Text = "Auto farm logs"
+        logsTitle.TextColor3 = Color3.new(1, 1, 1)
+        logsTitle.Font = Enum.Font.GothamBold
+        logsTitle.TextSize = 12
+        logsTitle.BackgroundTransparency = 1
+        logsTitle.ZIndex = 9
+        
+        local timeLabel = Instance.new("TextLabel", logsFrame)
+        timeLabel.Size = UDim2.new(1, 0, 0, 15)
+        timeLabel.Position = UDim2.new(0, 0, 0, 15)
+        timeLabel.Text = "Time: 00:00"
+        timeLabel.TextColor3 = Color3.fromRGB(200, 200, 255)
+        timeLabel.Font = Enum.Font.GothamBold
+        timeLabel.TextSize = 10
+        timeLabel.TextXAlignment = Enum.TextXAlignment.Left
+        timeLabel.BackgroundTransparency = 1
+        timeLabel.ZIndex = 9
+
+        local farmStateLabel = Instance.new("TextLabel", logsFrame)
+        farmStateLabel.Size = UDim2.new(0.5, 0, 0, 15)
+        farmStateLabel.Position = UDim2.new(0, 0, 0, 30)
+        farmStateLabel.Text = "Auto Farm: OFF"
+        farmStateLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+        farmStateLabel.Font = Enum.Font.GothamBold
+        farmStateLabel.TextSize = 10
+        farmStateLabel.TextXAlignment = Enum.TextXAlignment.Left
+        farmStateLabel.BackgroundTransparency = 1
+        farmStateLabel.ZIndex = 9
+
+        local statusLabel = Instance.new("TextLabel", logsFrame)
+        statusLabel.Size = UDim2.new(0.5, 0, 0, 15)
+        statusLabel.Position = UDim2.new(0.5, 0, 0, 30)
+        statusLabel.Text = "Status: Idle"
+        statusLabel.TextColor3 = Color3.new(0.8, 0.8, 0.8)
+        statusLabel.Font = Enum.Font.Gotham
+        statusLabel.TextSize = 10
+        statusLabel.TextXAlignment = Enum.TextXAlignment.Right
+        statusLabel.BackgroundTransparency = 1
+        statusLabel.ZIndex = 9
+
+        local gensLabel = Instance.new("TextLabel", logsFrame)
+        gensLabel.Size = UDim2.new(0.5, 0, 0, 15)
+        gensLabel.Position = UDim2.new(0, 0, 0, 45)
+        gensLabel.Text = "Gens repaired: 0"
+        gensLabel.TextColor3 = Color3.fromRGB(0, 255, 100)
+        gensLabel.Font = Enum.Font.GothamBold
+        gensLabel.TextSize = 10
+        gensLabel.TextXAlignment = Enum.TextXAlignment.Left
+        gensLabel.BackgroundTransparency = 1
+        gensLabel.ZIndex = 9
+
+        local distLabel = Instance.new("TextLabel", logsFrame)
+        distLabel.Size = UDim2.new(0.5, 0, 0, 15)
+        distLabel.Position = UDim2.new(0.5, 0, 0, 45)
+        distLabel.Text = "Dist: --"
+        distLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+        distLabel.Font = Enum.Font.Gotham
+        distLabel.TextSize = 10
+        distLabel.TextXAlignment = Enum.TextXAlignment.Right
+        distLabel.BackgroundTransparency = 1
+        distLabel.ZIndex = 9
+
+        local roleLabel = Instance.new("TextLabel", logsFrame)
+        roleLabel.Size = UDim2.new(0.5, 0, 0, 15)
+        roleLabel.Position = UDim2.new(0, 0, 0, 60)
+        roleLabel.Text = "Role: Survivor"
+        roleLabel.TextColor3 = Color3.new(0.8, 0.8, 0.8)
+        roleLabel.Font = Enum.Font.Gotham
+        roleLabel.TextSize = 10
+        roleLabel.TextXAlignment = Enum.TextXAlignment.Left
+        roleLabel.BackgroundTransparency = 1
+        roleLabel.ZIndex = 9
+
+        local cooldownLabel = Instance.new("TextLabel", logsFrame)
+        cooldownLabel.Size = UDim2.new(0.5, 0, 0, 15)
+        cooldownLabel.Position = UDim2.new(0.5, 0, 0, 60)
+        cooldownLabel.Text = "Teleport Cooldown: Ready"
+        cooldownLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+        cooldownLabel.Font = Enum.Font.Gotham
+        cooldownLabel.TextSize = 10
+        cooldownLabel.TextXAlignment = Enum.TextXAlignment.Right
+        cooldownLabel.BackgroundTransparency = 1
+        cooldownLabel.ZIndex = 9
+
+        local pingLabel = Instance.new("TextLabel", logsFrame)
+        pingLabel.Size = UDim2.new(0.5, 0, 0, 15)
+        pingLabel.Position = UDim2.new(0, 0, 0, 75)
+        pingLabel.Text = "Ping: 0ms"
+        pingLabel.TextColor3 = Color3.new(0.8, 0.8, 0.8)
+        pingLabel.Font = Enum.Font.Gotham
+        pingLabel.TextSize = 10
+        pingLabel.TextXAlignment = Enum.TextXAlignment.Left
+        pingLabel.BackgroundTransparency = 1
+        pingLabel.ZIndex = 9
+
+        local batGenCountLabel = Instance.new("TextLabel", logsFrame)
+        batGenCountLabel.Size = UDim2.new(0.5, 0, 0, 15)
+        batGenCountLabel.Position = UDim2.new(0.5, 0, 0, 75)
+        batGenCountLabel.Text = "Bat: 0 | Gen: 0"
+        batGenCountLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+        batGenCountLabel.Font = Enum.Font.Gotham
+        batGenCountLabel.TextSize = 10
+        batGenCountLabel.TextXAlignment = Enum.TextXAlignment.Right
+        batGenCountLabel.BackgroundTransparency = 1
+        batGenCountLabel.ZIndex = 9
+
+        task.spawn(function()
+            local lastTimeValue = 0
+            local dotIndex = 0
+            local lastWorkspaceTimerSearch = 0
+            local lastUIUpdate = 0
+            while logsFrame.Parent and _G.BBN_Running do
+                if tick() - lastUIUpdate < 0.5 then
+                    task.wait(0.1)
+                    continue
+                end
+                lastUIUpdate = tick()
+
+                -- Принудительное обновление дистанции в UI потоке
+                getKillerDist()
+                
+                -- Обновление счетчиков объектов
+                local currentFound = cachedObjects.data
+                if tick() - cachedObjects.lastUpdate > 4 then
+                    currentFound = findObjects()
+                end
+                local bCount = #currentFound.batteries
+                local gCount = 0
+                for _, g in ipairs(currentFound.generators) do if not isGeneratorFinished(g) then gCount = gCount + 1 end end
+                batGenCountLabel.Text = string.format("Bat: %d | Gen: %d", bCount, gCount)
+                
+                -- Update ON/OFF
+                local isFarmOn = states["AUTO FARM"]
+                farmStateLabel.Text = "Auto Farm: " .. (isFarmOn and "ON" or "OFF")
+                farmStateLabel.TextColor3 = isFarmOn and Color3.fromRGB(0, 255, 100) or Color3.fromRGB(255, 100, 100)
+
+                -- Update stats
+                gensLabel.Text = "Gens repaired: " .. (_G.BBN_GensRepaired or 0)
+                
+                local elapsed = tick() - lastTeleportTime
+                local remaining = math.max(0, math.ceil(nextTeleportCooldown - elapsed))
+                if remaining > 0 then
+                    cooldownLabel.Text = string.format("Teleport Cooldown: %d s", remaining)
+                    cooldownLabel.TextColor3 = Color3.fromRGB(255, 150, 100)
+                else
+                    cooldownLabel.Text = "Teleport Cooldown: Ready"
+                    cooldownLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+                end
+
+                local kDist = lastKillerDist or 1000
+                distLabel.Text = kDist < 1000 and string.format("Dist: %d m", math.floor(kDist)) or "Dist: --"
+                distLabel.TextColor3 = kDist < 55 and Color3.fromRGB(255, 0, 0) or Color3.fromRGB(255, 100, 100)
+
+                -- Пинг: используем комбинацию для максимальной точности
+                local ping = 0
+                pcall(function()
+                    -- Этот метод дает наиболее близкий результат к Shift+F3 (Network Latency)
+                    ping = math.floor(game:GetService("Stats").Network:GetRealTimeLatency() * 1000)
+                end)
+                
+                -- Если результат все еще низкий, пробуем альтернативный множитель или Stats
+                if ping < 10 then 
+                    pcall(function() ping = math.floor(Stats.PerformanceStats.Ping:GetValue()) end)
+                end
+                
+                -- Финальная коррекция: Shift+F3 часто показывает Round Trip Time, который может быть чуть выше
+                if ping > 0 then
+                    pingLabel.Text = "Ping: " .. (ping + 5) .. "ms" -- Небольшое смещение для визуального соответствия
+                else
+                    pingLabel.Text = "Ping: " .. math.floor(player:GetNetworkPing() * 1000) .. "ms"
+                end
+                
+                local currentMap = detectMap()
+                local gameFolder = Workspace:FindFirstChild("GAME")
+                local timerValue = gameFolder and (gameFolder:FindFirstChild("TIMER") or gameFolder:FindFirstChild("Time") or gameFolder:FindFirstChild("Timer"))
+                
+                -- Если в GAME не нашли, ищем в ReplicatedStorage (стандарт для Bite By Night)
+                if not timerValue then
+                    local rs = game:GetService("ReplicatedStorage")
+                    timerValue = rs:FindFirstChild("TIMER") or rs:FindFirstChild("Timer") or rs:FindFirstChild("Time") or rs:FindFirstChild("GameTime")
+                end
+                
+                -- Проверка Lighting (стандарт Roblox)
+                local lighting = game:GetService("Lighting")
+                local timeStr = lighting.TimeOfDay
+                
+                -- Редкий тяжёлый поиск по Workspace (раньше каждые 0.35 с давал лаги)
+                if not timerValue and tick() - lastWorkspaceTimerSearch > 20 then
+                    lastWorkspaceTimerSearch = tick()
+                    for _, v in ipairs(Workspace:GetDescendants()) do
+                        if (v.Name == "TIMER" or v.Name == "Timer" or v.Name == "Time" or v.Name == "GameTime") and (v:IsA("NumberValue") or v:IsA("IntValue") or v:IsA("StringValue")) then
+                            timerValue = v
+                            break
+                        end
+                    end
+                end
+                
+                -- Анимация точек змейкой
+                dotIndex = (dotIndex % 3) + 1
+                local dots = (dotIndex == 1 and ".  " or (dotIndex == 2 and ".. " or "..."))
+                
+                local char = player.Character
+                local isKiller = false
+                local isInLobby = false
+                
+                -- Прямая проверка иерархии: Workspace -> PLAYERS -> (Alive / Killer / Lobby)
+                local playersFolder = Workspace:FindFirstChild("PLAYERS")
+                if playersFolder and char then
+                    local parent = char.Parent
+                    if parent then
+                        local parentName = parent.Name:upper()
+                        if parentName == "LOBBY" then
+                            isInLobby = true
+                        elseif parentName == "KILLER" then
+                            isKiller = true
+                        end
+                    end
+                end
+                
+                -- Резервный метод проверки если папка PLAYERS не найдена
+                if not isInLobby and not isKiller and char then
+                    if char:GetAttribute("Role") == "Killer" then
+                        isKiller = true
+                    elseif currentMap == "Waiting..." then
+                        isInLobby = true
+                    end
+                end
+
+                if timerValue or timeStr then
+                    local totalSeconds = 0
+                    if timerValue then
+                        pcall(function()
+                            totalSeconds = tonumber(timerValue.Value) or 0
+                        end)
+                    else
+                        -- Парсим TimeOfDay (HH:MM:SS) в секунды для совместимости
+                        local h, m, s = timeStr:match("(%d+):(%d+):(%d+)")
+                        if h and m and s then
+                            totalSeconds = (tonumber(h) * 60) + tonumber(m) -- Для игры важны часы и минуты
+                        end
+                    end
+                    
+                    if isInLobby then
+                        statusLabel.Text = "Status: Waiting"
+                        -- Если в лобби, показываем реальное время игры или системное
+                        timeLabel.Text = "Time: " .. (timeStr and timeStr:sub(1,5) or "Lobby")
+                    elseif isKiller then
+                        statusLabel.Text = "Status: Playing"
+                        local gameHour = math.floor(totalSeconds / 60)
+                        local gameMinute = totalSeconds % 60
+                        if gameHour >= 24 then gameHour = gameHour % 24 end
+                        
+                        -- Формат 12-часовой с AM/PM
+                        local displayHour = gameHour % 12
+                        if displayHour == 0 then displayHour = 12 end
+                        local ampm = gameHour >= 12 and "PM" or "AM"
+                        
+                        timeLabel.Text = string.format("Time: %02d:%02d %s", displayHour, gameMinute, ampm)
+                    elseif states["AUTO FARM"] then
+                        statusLabel.Text = "Status: " .. (_G.BBN_Status or "Active")
+                        local gameHour = math.floor(totalSeconds / 60)
+                        local gameMinute = totalSeconds % 60
+                        if gameHour >= 24 then gameHour = gameHour % 24 end
+                        
+                        -- Формат 12-часовой с AM/PM
+                        local displayHour = gameHour % 12
+                        if displayHour == 0 then displayHour = 12 end
+                        local ampm = gameHour >= 12 and "PM" or "AM"
+                        
+                        timeLabel.Text = string.format("Time: %02d:%02d %s", displayHour, gameMinute, ampm)
+                    else
+                        statusLabel.Text = "Status: Waiting to start"
+                        if totalSeconds > 0 then
+                            local gameHour = math.floor(totalSeconds / 60)
+                            local gameMinute = totalSeconds % 60
+                            if gameHour >= 24 then gameHour = gameHour % 24 end
+                            local displayHour = gameHour % 12
+                            if displayHour == 0 then displayHour = 12 end
+                            local ampm = gameHour >= 12 and "PM" or "AM"
+                            timeLabel.Text = string.format("Time: %02d:%02d %s", displayHour, gameMinute, ampm)
+                        else
+                            timeLabel.Text = "Time: Waiting" .. dots
+                        end
+                    end
+                    lastTimeValue = totalSeconds
+                else
+                    timeLabel.Text = "Time: Waiting" .. dots
+                end
+
+                -- Дистанция до маньяка больше не обновляется здесь, только в боковом меню
+                
+                if isInLobby then
+                    roleLabel.Text = "Role: Lobby"
+                else
+                    roleLabel.Text = "Role: " .. (isKiller and "Killer" or "Survivor")
+                end
+                
+                task.wait(0.35) -- Снижаем нагрузку UI-цикла, чтобы убрать лаги после батареи
+            end
+        end)
+    end
+end
+
+mainTabBtn.MouseButton1Click:Connect(function() buildMenu("Settings") end)
+tpTabBtn.MouseButton1Click:Connect(function() buildMenu("Auto Farm") end)
+buildMenu("Auto Farm")
+
+task.defer(function()
+    if _G.BBN_Running then
+        toggleAutoCursor(true)
+        toggleInfinityStamina(true)
+    end
+end)
+
+task.spawn(function()
+    while _G.BBN_Running do
+        mapLabel.Text = "Map: " .. detectMap()
+        task.wait(5)
+    end
+end)
+
+inputConnection = UserInputService.InputBegan:Connect(function(input, processed)
+    if not _G.BBN_Running then return end
+    if input.KeyCode == Enum.KeyCode.Insert and not insBlocked then
+        menuVisible = not menuVisible
+        animateMenu(menuVisible)
+    elseif input.KeyCode == Enum.KeyCode.V then
+        spiritEnabled = not spiritEnabled
+        toggleSpiritMode(spiritEnabled)
+    elseif input.KeyCode == Enum.KeyCode.Z then
+        local char = player.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        
+        local pGui = player:FindFirstChild("PlayerGui")
+        local activeMiniEvent = nil
+        if pGui then
+            for _, g in ipairs(pGui:GetChildren()) do
+                if g:IsA("ScreenGui") and (g.Name:find("Minigame") or g.Name:find("Generator") or g:FindFirstChild("MainFrame") or g:FindFirstChild("Container")) then
+                    local main = g:FindFirstChild("MainFrame") or g:FindFirstChild("Container")
+                    if main and (main.Visible or (main:IsA("CanvasGroup") and main.GroupTransparency < 1)) then
+                        activeMiniEvent = g:FindFirstChild("Event", true) or main:FindFirstChild("Event", true)
+                        if activeMiniEvent then break end
+                    end
+                end
+            end
+        end
+        
+        if activeMiniEvent then
+            print("Fixing generator via Z key...")
+            activeMiniEvent:FireServer({["Wires"]=true,["Switches"]=true,["Lever"]=true,["Type"]="Finish"})
+        else
+            print("No active generator mini-game found!")
+        end
+    end
+end)
