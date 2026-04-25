@@ -1,7 +1,7 @@
 --[[
     Bite By Night - Project Menu
     Modern & Compact Design
-]]пкерек
+]]
 
 local Players = game:GetService("Players")пкур
 local CoreGui = game:GetService("CoreGui")
