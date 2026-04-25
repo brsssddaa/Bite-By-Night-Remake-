@@ -1,14 +1,13 @@
---[[1пекр
-пку9ш045123
+--[[
     Bite By Night - Project Menu
     Modern & Compact Design
-]]пкерек
-
-local Players = game:GetService("Players")пкур
+]]
+2 
+local Players = game:GetService("Players")
 local CoreGui = game:GetService("CoreGui")
-local TweenService = game:GetService("TweenService")екр
+local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")кекк
+local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local Stats = game:GetService("Stats")
 
